@@ -30,6 +30,12 @@ jobs:
           repository: ${{ inputs.source }}
           # Relative path under $GITHUB_WORKSPACE to place the repository
           path: "packages"
+      - name: List source files to publish
+        run: |
+          ls -lh tests/fixtures/example
+      - name: List existing versions
+        run: |
+          ls -l packages/preview/example
       - name: Put package to @preview namespace
         run: |
           mv tests/fixtures/example packages/preview/example/0.1.1
