@@ -58,6 +58,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           path: source
+          push-to-fork: ${{ inputs.destination }}
           commit-message: "build: bump @preview/example to 0.1.1"
           title: "build: bump @preview/example to 0.1.1"
           body: "This PR bumps @preview/example to 0.1.1"
