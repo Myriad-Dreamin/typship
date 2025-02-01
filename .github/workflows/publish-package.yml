@@ -29,21 +29,21 @@ jobs:
           # Default: ${{ github.repository }}
           repository: ${{ inputs.source }}
           # Relative path under $GITHUB_WORKSPACE to place the repository
-          path: "packages"
+          path: "source"
       - name: List source files to publish
         run: |
           ls -lh tests/fixtures/example
       - name: List existing versions
         run: |
-          ls -l packages/preview/example
+          ls -l source/packages/preview/example
       - name: Put package to @preview namespace
         run: |
-          mv tests/fixtures/example packages/preview/example/0.1.1
+          mv tests/fixtures/example source/packages/preview/example/0.1.1
       - name: Upload built typst.tmLanguage.json
         uses: actions/upload-artifact@v4
         with:
           name: preview-example-0.1.1
-          path: packages/preview/example/0.1.1
+          path: source/packages/preview/example/0.1.1
       - name: Make branch to release
         run: |
           git config --global user.email "camiyoru@gmail.com"
@@ -52,12 +52,12 @@ jobs:
           git add packages/preview/example/0.1.1
           git commit -m "build: bump @preview/example to 0.1.1"
           git push origin preview/example/v0.1.1
-        working-directory: packages
+        working-directory: source
       - name: Make PR
         uses: peter-evans/create-pull-request@v7
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          path: packages
+          path: source
           commit-message: "build: bump @preview/example to 0.1.1"
           title: "build: bump @preview/example to 0.1.1"
           body: "This PR bumps @preview/example to 0.1.1"
