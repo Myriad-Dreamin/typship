@@ -42,6 +42,8 @@ async fn main() {
 
 async fn match_cmd(current_dir: &Path, args: &Cli) -> anyhow::Result<()> {
     match &args.command {
+        // todo: why do we only get references instead of the moved value?
+        Commands::Package(cmd) => commands::package::package_main(cmd.clone()),
         Commands::Check(_) => commands::check::check(current_dir),
         Commands::Clean(args) => commands::clean::clean(args),
         Commands::Dev(_) => commands::dev::dev(current_dir).await,

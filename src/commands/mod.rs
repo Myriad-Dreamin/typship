@@ -8,10 +8,14 @@ pub mod exclude;
 pub mod init;
 pub mod install;
 pub mod login;
+pub mod package;
 pub mod publish;
 
 #[derive(Subcommand)]
 pub enum Commands {
+    #[command(name = "package", alias = "pkg")]
+    #[command(subcommand)]
+    Package(package::PackageCommands),
     Check(check::CheckArgs),
     Clean(clean::CleanArgs),
     Dev(dev::DevArgs),
