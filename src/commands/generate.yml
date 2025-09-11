@@ -60,7 +60,7 @@ jobs:
           path: plan-typship-manifest.json
 
   publish:
-    name: publish (${{ join(matrix.targets, ', ') }})
+    name: publish (${{ matrix.package.name }} {{ matrix.package.version }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
