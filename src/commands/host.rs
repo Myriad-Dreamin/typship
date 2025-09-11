@@ -22,6 +22,9 @@ pub struct HostArgs {
     #[arg(long)]
     /// The path to install the package in the source repository
     pub destination: Option<String>,
+    #[arg(long)]
+    /// The tag to host the package for
+    pub tag: Option<String>,
 }
 
 // if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include
