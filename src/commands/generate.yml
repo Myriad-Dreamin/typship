@@ -60,7 +60,7 @@ jobs:
           path: plan-typship-manifest.json
 
   publish:
-    name: publish (${{ matrix.package.name }} {{ matrix.package.version }})
+    name: publish (${{ matrix.package.name }}:${{ matrix.package.version }})
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
@@ -126,7 +126,7 @@ jobs:
         with:
           token: ${{ secrets.REGISTRY_TOKEN }}
           path: typst-packages
-          title: "@preview/{{ matrix.package.name }} {{ matrix.package.version }}"
+          title: "@preview/${{ matrix.package.name }}:${{ matrix.package.version }}"
           body: |
             I am submitting
             * [ ]  a new package
@@ -144,7 +144,7 @@ jobs:
             * [x]  [`exclude`d](https://github.com/typst/packages/blob/main/docs/tips.md#what-to-commit-what-to-exclude) PDFs or README images, if any, but not the LICENSE
 
             * [x]  ensured that my package is licensed such that users can use and distribute the contents of its template directory without restriction, after modifying them through normal use.
-          commit-message: "build: bump @preview/{{ matrix.package.name }} to {{ matrix.package.version }}"
-          branch: preview/{{ matrix.package.name }}/v{{ matrix.package.version }}
+          commit-message: "build: bump @preview/${{ matrix.package.name }} to ${{ matrix.package.version }}"
+          branch: preview/${{ matrix.package.name }}/v${{ matrix.package.version }}
           base: "main"
           draft: false
