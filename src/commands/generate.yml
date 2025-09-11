@@ -24,6 +24,13 @@ on:
         required: true
         default: "<<destination>>"
         type: string
+      # the path within that repo where the "<name>/<version>" directory should be put
+      # for the Typst package registry, keep this as is
+      push-to-fork:
+        description: Push to fork
+        required: true
+        default: "<<push-to-fork>>"
+        type: string
       dry-run:
         description: Dry run the publish process
         required: false
@@ -146,5 +153,6 @@ jobs:
             * [x]  ensured that my package is licensed such that users can use and distribute the contents of its template directory without restriction, after modifying them through normal use.
           commit-message: "build: bump @preview/${{ matrix.package.name }} to ${{ matrix.package.version }}"
           branch: preview/${{ matrix.package.name }}/v${{ matrix.package.version }}
+          push-to-fork: ${{ inputs.push-to-fork }}
           base: "main"
           draft: false
