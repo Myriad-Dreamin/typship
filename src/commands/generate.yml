@@ -29,11 +29,6 @@ on:
         required: false
         default: false
         type: boolean
-      publishing:
-        description: Whether to publish the package
-        required: false
-        default: true
-        type: boolean
 
 jobs:
   plan:
@@ -42,7 +37,7 @@ jobs:
       contents: write
     outputs:
       val: ${{ steps.plan.outputs.manifest }}
-      publishing: ${{ (!github.event.pull_request) || inputs.publishing == true }}
+      publishing: ${{ !github.event.pull_request }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up typship
