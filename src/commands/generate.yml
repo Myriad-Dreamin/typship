@@ -29,12 +29,20 @@ on:
         required: false
         default: false
         type: boolean
+      publishing:
+        description: Whether to publish the package
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      val: ${{ steps.plan.outputs.manifest }}
+      publishing: ${{ (!github.event.pull_request) || inputs.publishing == true }}
     steps:
       - uses: actions/checkout@v4
       - name: Set up typship
