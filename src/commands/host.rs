@@ -126,6 +126,7 @@ pub fn host(_current_dir: &Path, _args: &HostArgs) -> anyhow::Result<()> {
                 artifacts_matrix: Some(ArtifactsMatrix {
                     include: Some(tasks),
                 }),
+                pr_run_mode: None,
             },
         },
     };
