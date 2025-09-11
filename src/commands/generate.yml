@@ -50,7 +50,7 @@ jobs:
           echo "typship ran successfully"
           cat plan-typship-manifest.json
           echo "manifest=$(jq -c "." plan-typship-manifest.json)" >> "$GITHUB_OUTPUT"
-      - name: "Upload dist-manifest.json"
+      - name: "Upload typship-manifest.json"
         uses: actions/upload-artifact@v4
         with:
           name: artifacts-plan-typship-manifest
