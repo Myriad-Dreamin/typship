@@ -34,15 +34,6 @@ pub struct HostArgs {
 // != null && (needs.plan.outputs.publishing == 'true' ||
 // fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
 
-// runs-on: ${{ matrix.runner }}
-// container: ${{ matrix.container && matrix.container.image || null }}
-// mkdir -p typst-packages/${{ inputs.destination }}/${{ matrix.package.name }}
-// mv ${{ matrix.package.source }} typst-packages/${{ inputs.destination }}/${{
-// matrix.package.name }}/${{ matrix.package.version }} name: preview-${{
-// matrix.package.name }}-${{ matrix.package.version }} path: typst-packages/${{
-// inputs.destination }}/${{ matrix.package.name }}/${{ matrix.package.version
-// }} title: "@preview/{{ matrix.package.name }} {{ matrix.package.version }}"
-
 #[derive(Debug, Deserialize, Serialize)]
 struct Output {
     ci: Ci,
@@ -56,6 +47,7 @@ struct Ci {
 #[derive(Debug, Deserialize, Serialize)]
 struct CiGitHub {
     artifacts_matrix: Option<ArtifactsMatrix>,
+    pr_run_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
