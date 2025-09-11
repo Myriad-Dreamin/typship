@@ -55,11 +55,16 @@ struct Ci {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct CiGitHub {
-    artifacts_matrix: Option<Vec<ArtifactsMatrix>>,
+    artifacts_matrix: Option<ArtifactsMatrix>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ArtifactsMatrix {
+    include: Option<Vec<ArtifactsMatrixItem>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ArtifactsMatrixItem {
     runner: String,
     container: Option<Container>,
     package: Package,
@@ -112,7 +117,7 @@ pub fn host(_current_dir: &Path, _args: &HostArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        tasks.push(ArtifactsMatrix {
+        tasks.push(ArtifactsMatrixItem {
             runner: "ubuntu-24.04".to_string(),
             container: None,
             package: Package {
@@ -126,7 +131,9 @@ pub fn host(_current_dir: &Path, _args: &HostArgs) -> anyhow::Result<()> {
     let output = Output {
         ci: Ci {
             github: CiGitHub {
-                artifacts_matrix: Some(tasks),
+                artifacts_matrix: Some(ArtifactsMatrix {
+                    include: Some(tasks),
+                }),
             },
         },
     };
