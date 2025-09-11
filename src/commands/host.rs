@@ -25,6 +25,9 @@ pub struct HostArgs {
     #[arg(long)]
     /// The tag to host the package for
     pub tag: Option<String>,
+    #[arg(long, default_value = "json")]
+    /// The output format to use
+    pub output_format: Option<String>,
 }
 
 // if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include
