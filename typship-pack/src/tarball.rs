@@ -1,5 +1,3 @@
-use std::io::Write;
-
 use crate::error::malform;
 
 use super::*;
@@ -51,3 +49,4 @@ impl<R: Read> PackFs for TarballPack<R> {
 
 impl<R: Read> Pack for TarballPack<R> {}
 impl<R: Read> PackExt for TarballPack<R> {}
+impl<R: Read> CloneFromPack for TarballPack<R> {}

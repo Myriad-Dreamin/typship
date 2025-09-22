@@ -6,7 +6,7 @@ use crate::error::{other, other_io};
 
 use super::*;
 
-/// A package in the directory.
+/// A package in the memory.
 #[derive(Default, Debug, Clone)]
 pub struct MapPack {
     /// The files storing the package.
@@ -38,7 +38,7 @@ impl Pack for MapPack {}
 impl PackExt for MapPack {}
 
 impl CloneFromPack for MapPack {
-    fn clone_from_pack(&mut self, pack: &mut impl PackFs) -> std::io::Result<()> {
+    fn clone_from_pack(&mut self, pack: &mut dyn PackFs) -> std::io::Result<()> {
         pack.read_all(&mut |path, file| {
             let data = match file {
                 PackFile::Read(mut reader) => {

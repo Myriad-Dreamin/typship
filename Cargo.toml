@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["typship-cli", "typship-pack"]
+members = ["typship-cli", "typship-pack", "typship-proxy"]
 default-members = ["typship-cli"]
 
 [workspace.package]

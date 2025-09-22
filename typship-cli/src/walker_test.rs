@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 
-use typship::utils::walkers::{walker_install, walker_publish};
+use crate::utils::walkers::{walker_install, walker_publish};
 
 fn walker_test_path() -> PathBuf {
     <&str as Into<PathBuf>>::into(file!())

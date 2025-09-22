@@ -14,6 +14,8 @@ use url::Url;
 
 use crate::utils::{typst_cache_dir, typst_local_dir};
 
+type TypshipPack = Box<dyn Pack>;
+
 const DETACHED_NAMESPACE: &str = "DETACHED";
 
 fn download(url: &Url) -> Result<Vec<u8>, PackError> {
@@ -48,7 +50,8 @@ fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>, anyhow::Error> {
     Ok(decompressed)
 }
 
-/// TODO: remove this after a `CloneIntoPack` implementation from typship_pack is available
+/// TODO: remove this after a `CloneIntoPack` implementation from typship_pack
+/// is available
 fn construct_tarball(pack: &mut MapPack) -> Result<Vec<u8>, anyhow::Error> {
     fn custom(err: impl std::error::Error) -> typship_pack::PackError {
         typship_pack::PackError::Other(Some(format!("{err}").into()))
@@ -75,19 +78,19 @@ fn construct_tarball(pack: &mut MapPack) -> Result<Vec<u8>, anyhow::Error> {
     Ok(tar_builder.into_inner().map_err(custom)?.to_vec())
 }
 
-fn pack_from_http_url(url: &Url) -> Result<Arc<dyn Pack>, PackError> {
+fn pack_from_http_url(url: &Url) -> Result<TypshipPack, PackError> {
     match url.path() {
         tarball if tarball.ends_with(".tar") => {
             let tarball = download(url)?;
-            Ok(Arc::new(TarballPack::new(std::io::Cursor::new(tarball))))
+            Ok(Box::new(TarballPack::new(std::io::Cursor::new(tarball))))
         }
         gz if gz.ends_with(".tar.gz") || gz.ends_with(".tgz") => {
             let tar_gz = download(url)?;
-            Ok(Arc::new(TarballPack::new(gzip_reader(
+            Ok(Box::new(TarballPack::new(gzip_reader(
                 std::io::Cursor::new(tar_gz),
             ))))
         }
-        git if git.ends_with(".git") => Ok(Arc::new(GitClPack::new(
+        git if git.ends_with(".git") => Ok(Box::new(GitClPack::new(
             DETACHED_NAMESPACE.into(),
             url.clone(),
         ))),
@@ -97,9 +100,9 @@ fn pack_from_http_url(url: &Url) -> Result<Arc<dyn Pack>, PackError> {
     }
 }
 
-fn pack_from_ssh_url(url: &Url) -> Result<Arc<dyn Pack>, PackError> {
+fn pack_from_ssh_url(url: &Url) -> Result<TypshipPack, PackError> {
     if url.path().ends_with(".git") {
-        Ok(Arc::new(GitClPack::new(
+        Ok(Box::new(GitClPack::new(
             DETACHED_NAMESPACE.into(),
             url.clone(),
         )))
@@ -110,10 +113,7 @@ fn pack_from_ssh_url(url: &Url) -> Result<Arc<dyn Pack>, PackError> {
     }
 }
 
-fn pack_from_local_url(
-    url: &Url,
-    src_spec: PartialPackageSpec,
-) -> Result<Arc<dyn Pack>, PackError> {
+fn pack_from_local_url(url: &Url, src_spec: PartialPackageSpec) -> Result<TypshipPack, PackError> {
     let storage_path = match url.scheme() {
         "data" => typst_local_dir(),
         "cache" => typst_cache_dir(),
@@ -141,7 +141,7 @@ fn pack_from_local_url(
         .with_partial_spec(src_spec)
         .ready()
     {
-        Ok(Arc::new(dir_pack))
+        Ok(Box::new(dir_pack))
     } else {
         Err(PackError::Other(Some(eco_format!(
             "Cannot infer pack path from local URL: {url}",
@@ -205,17 +205,17 @@ fn pack_from_universe_url(
     Ok(Arc::new(UniversePack::new(spec)))
 }
 
-fn parse_url(url: &str, src_spec: PartialPackageSpec) -> Result<Arc<dyn Pack>, PackError> {
+fn parse_url(url: &str, src_spec: PartialPackageSpec) -> Result<TypshipPack, PackError> {
     let url = Url::parse(url)
         .map_err(|e| PackError::Other(Some(format!("Invalid URL: {}", e).into())))?;
     let scheme = url.scheme();
     match scheme {
-        "git" => Ok(Arc::new(GitClPack::new(
+        "git" => Ok(Box::new(GitClPack::new(
             DETACHED_NAMESPACE.into(),
             url.clone(),
         ))),
         // TODO: file can be .git
-        "file" => Ok(Arc::new(DirPack::new(PathBuf::from(
+        "file" => Ok(Box::new(DirPack::new(PathBuf::from(
             url.to_file_path().map_err(|_| {
                 PackError::Other(Some(eco_format!(
                     "Invalid file URL `{url}`: cannot convert to file path"
@@ -364,18 +364,18 @@ impl PackKind {
 }
 
 pub async fn copy(args: &CopyArgs) -> anyhow::Result<()> {
-    let src = match args.source.as_str() {
+    let mut src: TypshipPack = match args.source.as_str() {
         "-" => {
             let mut data = vec![];
             tokio::io::stdin().read_to_end(&mut data).await?;
-            Arc::new(TarballPack::new(std::io::Cursor::new(data)))
+            Box::new(TarballPack::new(std::io::Cursor::new(data))) as TypshipPack
         }
         rest => parse_url(&args.source, Default::default())?,
     };
     let src_spec = src
         .read("typst.toml")
         .ok()
-        .and_then(|file| {
+        .and_then(|mut file| {
             // file
             // PackageManifest
             let mut buf = Vec::new();
@@ -390,10 +390,10 @@ pub async fn copy(args: &CopyArgs) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
     let mut writing_to_stdout = false;
-    let dst: Arc<dyn Pack> = match args.destination.as_str() {
+    let dst: TypshipPack = match args.destination.as_str() {
         "-" => {
             writing_to_stdout = true;
-            Arc::new(TarballPack::new(std::io::Cursor::new(vec![])))
+            Box::new(TarballPack::new(std::io::Cursor::new(vec![])))
         }
         rest => parse_url(&args.destination, src_spec)?,
     };
@@ -405,7 +405,7 @@ pub async fn copy(args: &CopyArgs) -> anyhow::Result<()> {
     info!("Copying {} to {}", args.source, args.destination);
     info!("Loading {} to memory...", args.source);
     let mut pack = MapPack::default();
-    pack.clone_from_pack(Arc::make_mut(&mut src.clone()))?;
+    pack.clone_from_pack(src.as_mut())?;
     // dst.clone_from_memory_pack(pack)?;
 
     Ok(())

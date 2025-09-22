@@ -5,6 +5,8 @@ use std::io::{self, Read};
 use std::path::Path;
 use std::sync::Arc;
 
+use enum_dispatch::enum_dispatch;
+
 mod error;
 #[cfg(feature = "fs-pack")]
 mod fs;
@@ -22,7 +24,7 @@ mod universe;
 
 use ecow::EcoVec;
 use tinymist_std::{ImmutBytes, ImmutPath};
-use typst_syntax::package::{PackageSpec, VersionlessPackageSpec};
+pub use typst_syntax::package::{PackageSpec, VersionlessPackageSpec};
 
 pub use error::{PackError, PackResult};
 #[cfg(feature = "fs-pack")]
@@ -67,6 +69,7 @@ pub enum PackEntries<'a> {
 }
 
 /// The pack trait is used for read/write files in a package.
+#[enum_dispatch]
 pub trait PackFs: fmt::Debug {
     /// Read files from the package.
     fn read_all(
@@ -92,9 +95,11 @@ pub enum PackSpecifier {
 }
 
 /// The pack trait is used to hold a package.
+#[enum_dispatch]
 pub trait Pack: PackFs {}
 
 /// The pack trait extension.
+#[enum_dispatch]
 pub trait PackExt: Pack {
     /// Filter the package files to read by a function.
     fn filter(&mut self, f: impl Fn(&str) -> bool + Send + Sync) -> impl Pack
@@ -106,9 +111,10 @@ pub trait PackExt: Pack {
 }
 
 /// The pack trait is used to hold a package.
+#[enum_dispatch]
 pub trait CloneFromPack: fmt::Debug {
     /// Clones the pack into a new pack.
-    fn clone_from_pack(&mut self, _: &mut impl PackFs) -> std::io::Result<()> {
+    fn clone_from_pack(&mut self, _: &mut dyn PackFs) -> std::io::Result<()> {
         Err(unsupported())
     }
 }
@@ -118,4 +124,34 @@ pub trait CloneFromPack: fmt::Debug {
 pub struct Package {
     /// The underlying pack.
     pub pack: Arc<dyn Pack + Send + Sync>,
+}
+
+impl<P: PackFs> PackFs for Box<P> {
+    fn read_all(
+        &mut self,
+        f: &mut (dyn FnMut(&str, PackFile) -> PackResult<()> + Send + Sync),
+    ) -> PackResult<()> {
+        self.as_mut().read_all(f)
+    }
+    fn read(&self, path: &str) -> io::Result<PackFile<'_>> {
+        self.as_ref().read(path)
+    }
+    fn entries(&self) -> io::Result<PackEntries<'_>> {
+        self.as_ref().entries()
+    }
+}
+
+impl<P: Pack> Pack for Box<P> {}
+impl<P: PackExt> PackExt for Box<P> {
+    fn filter(&mut self, f: impl Fn(&str) -> bool + Send + Sync) -> impl Pack
+    where
+        Self: std::marker::Sized,
+    {
+        self.as_mut().filter(f)
+    }
+}
+impl<P: CloneFromPack> CloneFromPack for Box<P> {
+    fn clone_from_pack(&mut self, pack: &mut dyn PackFs) -> std::io::Result<()> {
+        self.as_mut().clone_from_pack(pack)
+    }
 }

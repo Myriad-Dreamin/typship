@@ -64,3 +64,6 @@ async fn match_cmd(current_dir: &Path, args: &Cli) -> anyhow::Result<()> {
         Commands::Publish(args) => commands::publish::publish(current_dir, args).await,
     }
 }
+
+#[cfg(test)]
+mod walker_test;

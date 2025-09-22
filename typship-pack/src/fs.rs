@@ -47,7 +47,7 @@ impl<P: AsRef<Path>> PackExt for DirPack<P> {
 }
 
 impl<P: AsRef<Path>> CloneFromPack for DirPack<P> {
-    fn clone_from_pack(&mut self, pack: &mut impl PackFs) -> std::io::Result<()> {
+    fn clone_from_pack(&mut self, pack: &mut dyn PackFs) -> std::io::Result<()> {
         let base = self.path.as_ref();
         pack.read_all(&mut |path, file| {
             let path = base.join(path);

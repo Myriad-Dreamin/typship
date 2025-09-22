@@ -23,6 +23,7 @@ reqwest = { workspace = true, optional = true, features = [
 dirs = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
+enum_dispatch = "0.3.13"
 
 
 [features]
