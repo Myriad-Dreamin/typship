@@ -6,6 +6,8 @@ use clap::Parser;
 use ecow::EcoString;
 use serde::{Deserialize, Serialize};
 
+use crate::utils::walkers::walker_publish;
+
 const LONG_ABOUT: &str = "Host the package in a GitHub repository.";
 
 #[derive(Parser)]
@@ -74,7 +76,7 @@ struct Package {
     version: String,
 }
 
-pub fn host(_current_dir: &Path, args: &HostArgs) -> anyhow::Result<()> {
+pub fn host(current_dir: &Path, args: &HostArgs) -> anyhow::Result<()> {
     let packages = args.packages.as_deref().unwrap_or("all");
     let mut packages = packages.split_whitespace().collect::<Vec<_>>();
     if packages == ["all"] {
@@ -82,10 +84,7 @@ pub fn host(_current_dir: &Path, args: &HostArgs) -> anyhow::Result<()> {
     }
 
     // find packages in workspace
-    let package_dirs = ignore::WalkBuilder::new(".")
-        .standard_filters(true)
-        .add_custom_ignore_filename(".typstignore")
-        .build()
+    let package_dirs = walker_publish(current_dir)
         .filter_map(|entry| {
             let entry = entry.ok()?;
             (entry.path().file_name()? == "typst.toml").then_some(entry)

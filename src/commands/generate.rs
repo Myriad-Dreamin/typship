@@ -20,7 +20,7 @@ pub struct GenerateArgs {
     pub destination: Option<String>,
 }
 
-pub fn generate(_current_dir: &Path, args: &GenerateArgs) -> anyhow::Result<()> {
+pub fn generate(current_dir: &Path, args: &GenerateArgs) -> anyhow::Result<()> {
     let source = args.source.as_deref().unwrap_or("typst/packages");
     let push_to_fork = args
         .push_to_fork
@@ -44,9 +44,11 @@ pub fn generate(_current_dir: &Path, args: &GenerateArgs) -> anyhow::Result<()> 
     // .github/workflows/Release.yml
     // This function will handle the generation of the project files.
     println!("Generating project files...");
-    std::fs::create_dir_all(".github/workflows").context("Failed to create directory")?;
+    let workflow_dir = current_dir.join(".github").join("workflows");
+    std::fs::create_dir_all(&workflow_dir)
+        .context("Failed to create directory")?;
     std::fs::write(
-        ".github/workflows/releast-typst.yml",
+        workflow_dir.join("release-typst.yml"),
         include_str!("generate.yml")
             .replace("\"<<source>>\"", &format!("{source:?}"))
             .replace("\"<<destination>>\"", &format!("{destination:?}"))
