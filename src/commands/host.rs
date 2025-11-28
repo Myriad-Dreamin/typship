@@ -74,8 +74,8 @@ struct Package {
     version: String,
 }
 
-pub fn host(_current_dir: &Path, _args: &HostArgs) -> anyhow::Result<()> {
-    let packages = _args.packages.as_deref().unwrap_or("all");
+pub fn host(_current_dir: &Path, args: &HostArgs) -> anyhow::Result<()> {
+    let packages = args.packages.as_deref().unwrap_or("all");
     let mut packages = packages.split_whitespace().collect::<Vec<_>>();
     if packages == ["all"] {
         packages = vec![];

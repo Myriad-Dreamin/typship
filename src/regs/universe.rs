@@ -250,8 +250,7 @@ pub async fn publish(
         {
             if !Confirm::new()
                 .with_prompt(format!(
-                    "Branch `{}` already exists in your fork. Do you want to overwrite it?",
-                    branch_name
+                    "Branch `{branch_name}` already exists in your fork. Do you want to overwrite it?"
                 ))
                 .default(false)
                 .interact()?
@@ -527,7 +526,7 @@ async fn upload_files_sparse_checkout(
     let temp_dir = TempDir::new()?;
     let temp_path = temp_dir.path();
 
-    let fork_url = format!("https://github.com/{}/{}.git", user_login, repo_name);
+    let fork_url = format!("https://github.com/{user_login}/{repo_name}.git");
     let target_path = submission.repo_path();
 
     let output = Command::new("git")
