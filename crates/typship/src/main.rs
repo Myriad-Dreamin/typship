@@ -1,7 +1,12 @@
 //! # typship
 //!
-//! The description.
+//! A simple package manager for Typst.
 
-fn main() {
-    println!("Reverse the World")
+mod cli;
+mod manifest;
+
+use anyhow::Result;
+
+fn main() -> Result<()> {
+    cli::dispatch(std::env::args_os())
 }
