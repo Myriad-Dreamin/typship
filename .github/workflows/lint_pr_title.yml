@@ -1,4 +1,4 @@
-name: rust_template::lint_pr_title
+name: typship::lint_pr_title
 on:
   pull_request:
     types: [opened, edited, synchronize]

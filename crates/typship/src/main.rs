@@ -1,4 +1,4 @@
-//! # rust-template
+//! # typship
 //!
 //! The description.
 

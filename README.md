@@ -1,4 +1,4 @@
-# rust-template
+# typship
 
 ## Setup
 
@@ -9,12 +9,12 @@ Search and edit:
 
 rename the project name:
 
-- `.vscode/rust-template.code-workspace`
+- `.vscode/typship.code-workspace`
 
 ## Development
 
 VSCode:
 
 ```bash
-code .vscode/rust-template.code-workspace
+code .vscode/typship.code-workspace
 ```
