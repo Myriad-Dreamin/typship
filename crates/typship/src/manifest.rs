@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// The file name of the typst package manifest.
 const MANIFEST_FILE: &str = "typst.toml";
@@ -38,10 +38,7 @@ fn init_dir(dir: &Path, name: &str) -> Result<()> {
         .next()
         .is_some()
     {
-        bail!(
-            "refusing to initialize: {} is not empty",
-            dir.display()
-        );
+        bail!("refusing to initialize: {} is not empty", dir.display());
     }
 
     let manifest = dir.join(MANIFEST_FILE);
