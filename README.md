@@ -1,32 +1,20 @@
 # typship
 
-A tool for Typst package development and publishing.
+## Setup
 
-## Notice
+Search and edit:
+- `rust-template`
+- `rust_template`
+- `The description.`
 
-To use `publish universe`, you will need to generate a token (fine-grained) with the following permissions to your fork of the packages repository:
+rename the project name:
 
-- *Read* access to *metadata*
+- `.vscode/typship.code-workspace`
 
-- *Read and write* access to *contents*
+## Development
 
-Here's GitHub's [documentation](https://docs.github.com/en/github/authenticating-to-github/creating-a-personal-access-token) on how to create a personal access token.
+VSCode:
 
-## Usage
-
-```sh
-typship help
+```bash
+code .vscode/typship.code-workspace
 ```
-
-## TODO
-
-- [x] Package init
-- [x] Package validation
-- [ ] ~~init with git~~
-- [x] install to local
-- [ ] package download got checkout
-- [x] publish on Universe
-- [x] exclude command
-- [ ] i18n
-
-- [ ] Better implementation investigation

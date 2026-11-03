@@ -1,8 +1,6 @@
-/target
+.DS_STORE
+.idea
 
-# Mac OS
-.DS_Store
-
-# Testing
-typst.toml
-src/*.typ
+target/
+out/
+node_modules/
