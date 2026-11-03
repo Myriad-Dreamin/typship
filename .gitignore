@@ -1,0 +1,6 @@
+.DS_STORE
+.idea
+
+target/
+out/
+node_modules/

@@ -1,0 +1,80 @@
+[workspace.package]
+description = "The description."
+authors = ["Myriad-Dreamin"]
+version = "0.1.0"
+rust-version = "1.85.0" # MSRV
+edition = "2024"
+readme = "README.md"
+license = "Apache-2.0"
+homepage = "https://github.com/Myriad-Dreamin/rust-template"
+repository = "https://github.com/Myriad-Dreamin/rust-template"
+
+ 
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[profile.release]
+codegen-units = 1 # Reduce number of codegen units to increase optimizations
+opt-level = 3
+panic = "abort"   # Abort on panic
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+[workspace.dependencies]
+
+# general
+anyhow = "1"
+## async
+# tokio = { version = "1", features = ["full"] }
+## sync
+# rayon = "1"
+
+# cryptography and processing
+## serialization
+# serde = "1"
+## serialization:json
+# serde_json = "1"
+## serialization:toml
+# toml = "0.8"
+
+# cli
+## clap = { version = "4.5", features = ["derive", "env", "unicode", "wrap_help"] }
+## clap_complete = "4.5"
+## clap_complete_fig = "4.5"
+
+# logging and tracing
+# env_logger = "0.11"
+# log = "0.4.25"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "warn"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+
+unexpected_cfgs = { level = "allow", check-cfg = [
+    'cfg(wasm_bindgen_unstable_test_coverage)',
+    'cfg(noop)',
+    'cfg(used_linker)',
+] }
+
+[workspace.lints.clippy]
+uninlined_format_args = "warn"
+missing_safety_doc = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[workspace.metadata.typos.default]
+locale = "en-us"
+
+[workspace.metadata.typos.default.extend-words]
+labelled = "labelled"
+onces = "onces"
+withs = "withs"
+
+[workspace.metadata.typos.files]
+ignore-hidden = false
+extend-exclude = ["/.git", "fixtures"]
