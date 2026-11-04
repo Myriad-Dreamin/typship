@@ -1029,3 +1029,33 @@ pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_source_detects_shapes() {
+        assert!(matches!(parse_source("./a").unwrap(), Source::Fs(_)));
+        assert!(matches!(parse_source("-").unwrap(), Source::Stdin));
+        assert!(matches!(
+            parse_source("@preview/foo").unwrap(),
+            Source::Registry { namespace, name, .. } if namespace == "preview" && name == "foo"
+        ));
+        assert!(matches!(
+            parse_source("https://example.com/x.tar.gz").unwrap(),
+            Source::Url { .. }
+        ));
+        assert!(parse_source("not a pack").is_err());
+    }
+
+    #[test]
+    fn parse_dest_detects_shapes() {
+        assert!(matches!(parse_dest("./b").unwrap(), Dest::Dir(_)));
+        assert!(matches!(
+            parse_dest("./b.tar.gz").unwrap(),
+            Dest::Tarball(_)
+        ));
+        assert!(parse_dest("https://example.com/x").is_err());
+    }
+}
