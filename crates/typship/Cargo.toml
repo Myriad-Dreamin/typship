@@ -14,6 +14,8 @@ rust-version.workspace = true
 [dependencies]
 
 anyhow.workspace = true
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1.0.11"
 palc.workspace = true
 
 [lints]

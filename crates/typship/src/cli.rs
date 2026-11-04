@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use palc::Parser;
 
-use crate::manifest;
+use crate::{download, manifest};
 
 /// A simple package manager for Typst.
 #[derive(Debug, palc::Parser)]
@@ -29,8 +29,20 @@ struct Cli {
 enum Command {
     /// Initialize the current directory as a typship package.
     Init,
+    Download(DownloadArgs),
     /// Print the help message.
     Help,
+}
+
+/// Arguments of `typship download <SPEC>`.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Download a package from a registry into the local cache.")]
+struct DownloadArgs {
+    /// Package spec: `name` or `name:version`.
+    spec: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
 }
 
 /// Renders the top-level help message via `palc`.
@@ -47,6 +59,10 @@ pub fn dispatch(args: impl Iterator<Item = OsString>) -> Result<()> {
         }
         Ok(cli) => match cli.command {
             Some(Command::Init) => manifest::init_current_dir(),
+            Some(Command::Download(args)) => download::run(&download::Download {
+                spec: args.spec,
+                registry: args.registry,
+            }),
             Some(Command::Help) | None => {
                 println!("{}", render_help());
                 Ok(())
