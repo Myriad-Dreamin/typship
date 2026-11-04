@@ -41,6 +41,10 @@ anyhow = "1"
 ## serialization:toml
 # toml = "0.8"
 
+# network (TLS) and compression only, per proposal #119
+ureq = { version = "2", default-features = false, features = ["tls"] }
+flate2 = "1"
+
 # cli
 palc = "=0.0.2"
 ## clap = { version = "4.5", features = ["derive", "env", "unicode", "wrap_help"] }

@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use palc::Parser;
 
-use crate::manifest;
+use crate::{manifest, pack};
 
 /// A simple package manager for Typst.
 #[derive(Debug, palc::Parser)]
@@ -29,8 +29,36 @@ struct Cli {
 enum Command {
     /// Initialize the current directory as a typship package.
     Init,
+    Copy(CopyArgs),
+    Link(LinkArgs),
     /// Print the help message.
     Help,
+}
+
+/// Copy a named pack from a source to a destination.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Copy a named pack from a source to a destination.")]
+struct CopyArgs {
+    /// The source pack.
+    src: String,
+    /// The destination pack.
+    dst: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
+}
+
+/// Link a source pack to a destination instead of copying.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Link a source pack to a destination instead of copying.")]
+struct LinkArgs {
+    /// The source pack.
+    src: String,
+    /// The destination pack.
+    dst: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
 }
 
 /// Renders the top-level help message via `palc`.
@@ -47,6 +75,8 @@ pub fn dispatch(args: impl Iterator<Item = OsString>) -> Result<()> {
         }
         Ok(cli) => match cli.command {
             Some(Command::Init) => manifest::init_current_dir(),
+            Some(Command::Copy(args)) => pack::copy(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Link(args)) => pack::link(&args.src, &args.dst, args.registry.as_deref()),
             Some(Command::Help) | None => {
                 println!("{}", render_help());
                 Ok(())
