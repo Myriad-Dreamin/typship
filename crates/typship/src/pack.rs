@@ -1,12 +1,11 @@
 //! The named Pack abstraction: parsing, detection and transport of pack
 //! sources and destinations.
 //!
-//! New dependencies are limited to the two classes the proposal allows:
-//! TLS (`ureq` with rustls) and compression (`flate2`). The tar container
-//! itself is encoded and decoded here with the standard library only
-//! (ustar headers, GNU long-name entries and PAX `path` records for
-//! reading, end-of-archive blocks for writing), and JSON responses are
-//! read with the small built-in parser in [`json`].
+//! Standard formats are handled by standard crates: JSON with
+//! `serde_json`, the tar container with `tar`, gzip with `flate2`,
+//! percent-encoding with `percent-encoding`, and TOML manifest writing
+//! (in [`crate::manifest`]) with `toml`. No hand-written parsers or
+//! encoders for standard formats remain (admin direction 2026-11-08).
 //!
 //! Safety posture for untrusted archives: member paths are validated (no
 //! absolute paths, no `..`, no backslashes, no colons, no Windows device
@@ -23,7 +22,7 @@
 //! request.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -31,6 +30,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total per-request timeout; a network path must never hang forever.
@@ -1232,18 +1232,23 @@ pub fn extract_tarball_with_limits(
     Ok(())
 }
 
-/// Encode files under `dir` (recursively) as a gzipped tarball.
+/// Encode files under `dir` (recursively) as a gzipped tarball; the
+/// ustar encoding itself is delegated to the `tar` crate.
 pub fn pack_tarball(dir: &Path) -> Result<Vec<u8>> {
     let enc = GzEncoder::new(Vec::new(), Compression::default());
-    let mut tar = TarWriter { out: enc };
-    add_tree(&mut tar, dir, "")?;
-    tar.write_end_blocks()?;
-    tar.out.finish().context("finishing gzip stream")
+    let mut builder = tar::Builder::new(enc);
+    add_tree(&mut builder, dir, "")?;
+    builder.finish().context("finishing tar archive")?;
+    builder
+        .into_inner()
+        .context("finishing gzip stream")?
+        .finish()
+        .context("finishing gzip stream")
 }
 
-fn add_tree(tar: &mut TarWriter, dir: &Path, rel: &str) -> Result<()> {
+fn add_tree(builder: &mut tar::Builder<GzEncoder<Vec<u8>>>, dir: &Path, rel: &str) -> Result<()> {
     if !rel.is_empty() {
-        tar.write_entry(rel, true, &[])?;
+        append_entry(builder, rel, true, &[])?;
     }
     let mut entries: Vec<_> = fs::read_dir(dir)
         .with_context(|| format!("reading {}", dir.display()))?
@@ -1258,106 +1263,54 @@ fn add_tree(tar: &mut TarWriter, dir: &Path, rel: &str) -> Result<()> {
         };
         let path = entry.path();
         if entry.file_type()?.is_dir() {
-            add_tree(tar, &path, &child_rel)?;
+            add_tree(builder, &path, &child_rel)?;
         } else {
             let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            tar.write_entry(&child_rel, false, &data)?;
+            append_entry(builder, &child_rel, false, &data)?;
         }
     }
     Ok(())
 }
 
-struct TarWriter {
-    out: GzEncoder<Vec<u8>>,
-}
-
-/// Split a too-long archive path into a ustar `prefix` + `name` pair,
-/// keeping the name (with its trailing slash for directories) at or under
-/// 100 bytes and the prefix at or under 155.
-fn split_ustar_path(name: &str) -> Option<(String, String)> {
-    if name.len() <= 100 {
-        return Some((String::new(), name.to_string()));
-    }
-    let bytes = name.as_bytes();
-    let mut best: Option<usize> = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'/' && i <= 155 && name.len() - i - 1 <= 100 {
-            best = Some(i);
-        }
-    }
-    let i = best?;
-    Some((name[..i].to_string(), name[i + 1..].to_string()))
-}
-
-impl TarWriter {
-    fn write_end_blocks(&mut self) -> Result<()> {
-        self.out.write_all(&[0u8; 1024])?;
-        Ok(())
-    }
-
-    fn write_entry(&mut self, path: &str, is_dir: bool, data: &[u8]) -> Result<()> {
-        let mut header = [0u8; 512];
-        let name = if is_dir {
-            format!("{path}/")
-        } else {
-            path.to_string()
-        };
-        match split_ustar_path(&name) {
-            Some((prefix, short)) => {
-                if !prefix.is_empty() {
-                    header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
-                }
-                header[..short.len()].copy_from_slice(short.as_bytes());
-            }
-            None => {
-                // Not splittable into ustar fields (the name part would
-                // exceed 100 bytes even after a 155-byte prefix): refuse
-                // rather than emit any extended-header entry — the
-                // writer creates plain files and directories only.
-                bail!(
-                    "archive path `{name}` is too long for the ustar layout (over 100 bytes after a 155-byte prefix); no such file will be written"
-                );
-            }
-        }
-        self.finish_header(&mut header, if is_dir { b'5' } else { b'0' }, data.len())?;
-        if !is_dir {
-            self.out.write_all(data)?;
-            self.write_padding(data.len())?;
-        }
-        Ok(())
-    }
-
-    fn write_padding(&mut self, len: usize) -> Result<()> {
-        let pad = ((512 - (len as u64 % 512)) % 512) as usize;
-        if pad > 0 {
-            self.out.write_all(&vec![0u8; pad])?;
-        }
-        Ok(())
-    }
-
-    /// Fill the fixed fields of a header, compute and store its
-    /// checksum, and write it out.
-    fn finish_header(&mut self, header: &mut [u8; 512], typeflag: u8, size: usize) -> Result<()> {
-        let mode = match typeflag {
-            b'5' => b"0000755\x00",
-            _ => b"0000644\x00",
-        };
-        header[100..108].copy_from_slice(mode);
-        header[108..116].copy_from_slice(b"0000000\x00"); // uid
-        header[116..124].copy_from_slice(b"0000000\x00"); // gid
-        let size_field = format!("{size:011o}\x00");
-        header[124..136].copy_from_slice(size_field.as_bytes());
-        header[136..148].copy_from_slice(b"00000000000\x00"); // mtime
-        header[148..156].copy_from_slice(b"        "); // checksum placeholder
-        header[156] = typeflag;
-        header[257..263].copy_from_slice(b"ustar\x00");
-        header[263..265].copy_from_slice(b"00");
-        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\x00 ");
-        header[148..156].copy_from_slice(cs.as_bytes());
-        self.out.write_all(header)?;
-        Ok(())
-    }
+/// Append one member to the archive: a plain file or a directory, with
+/// fixed metadata (mode 0644/0755, mtime 0, uid/gid 0).
+///
+/// The path is set through `Header::set_path` directly — for a ustar
+/// header that means a split into `prefix` + `name` or an error, never
+/// an extension entry, so an unsplittable over-long path is refused with
+/// a clear message instead of producing a special-format member
+/// (`Builder::append_data` would silently fall back to a GNU long-name
+/// entry, which the writer contract forbids).
+fn append_entry(
+    builder: &mut tar::Builder<GzEncoder<Vec<u8>>>,
+    path: &str,
+    is_dir: bool,
+    data: &[u8],
+) -> Result<()> {
+    // No trailing slash on directory entries: the typeflag marks the
+    // directory, and a trailing slash would break `set_path` for
+    // long single-component directory names.
+    let name = path.to_string();
+    let mut header = tar::Header::new_ustar();
+    header.set_path(&name).map_err(|e| {
+        anyhow!(
+            "archive path `{name}` is too long for the ustar layout (over 100 bytes after a 155-byte prefix); no such file will be written ({e})"
+        )
+    })?;
+    header.set_entry_type(if is_dir {
+        tar::EntryType::Directory
+    } else {
+        tar::EntryType::Regular
+    });
+    header.set_size(if is_dir { 0 } else { data.len() as u64 });
+    header.set_mode(if is_dir { 0o755 } else { 0o644 });
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_cksum();
+    builder
+        .append(&header, data)
+        .with_context(|| format!("appending `{name}` to the archive"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1526,35 +1479,22 @@ fn release_upload_url(body: &str, tag: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("release for tag `{tag}` has no upload_url"))
 }
 
-/// JSON string escape for embedding a value into a JSON document.
+/// JSON string escape for embedding a value into a JSON document;
+/// delegated to `serde_json` so the escaping rules live in one place.
 fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    format!("\"{out}\"")
+    serde_json::to_string(s).expect("string serialization cannot fail")
 }
+
+/// The RFC 3986 unreserved set: everything else is percent-encoded.
+const UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// Percent-encode everything outside the unreserved set.
 fn percent_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
+    utf8_percent_encode(s, UNRESERVED).to_string()
 }
 
 /// Link a named pack from `src` to `dst` instead of copying.
@@ -1666,6 +1606,7 @@ pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
 mod tests {
     use super::*;
     use flate2::read::GzDecoder;
+    use std::io::Write;
 
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2196,9 +2137,12 @@ mod tests {
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("中文.typ"), "hello").unwrap();
         // A long multi-byte path that splits cleanly into a ustar
-        // prefix + name (prefix ≤155 bytes, name ≤100 bytes).
-        let long_dir = "目".repeat(40); // 120 bytes, fits the prefix
+        // prefix + name (prefix ≤155 bytes, name ≤100 bytes); each
+        // directory component stays at or under 100 bytes, since a
+        // single over-long component is refused by the writer contract.
+        let long_dir = "目".repeat(33); // 99 bytes, fits the name field directly
         let long_name = format!("{}.typ", "录".repeat(30)); // 93 bytes, fits the name
+        // 99 + 1 + 93 = 193 bytes: the file entry needs the prefix split.
         fs::create_dir_all(src.join(&long_dir)).unwrap();
         fs::write(src.join(&long_dir).join(&long_name), "long").unwrap();
         let gz = pack_tarball(&src).unwrap();

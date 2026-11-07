@@ -36,11 +36,15 @@ anyhow = "1"
 # cryptography and processing
 ## serialization:json
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 ## serialization:toml
-# toml = "0.8"
+toml = "0.8"
+## url utilities: percent-encoding
+percent-encoding = "2"
 
-# network (TLS) and compression only, per proposal #119; tar/serde_json
-# read with standard crates (admin direction 2026-11-08)
+# network (TLS) and compression only, per proposal #119; tar/serde_json/
+# percent-encoding/toml all read or write with standard crates
+# (admin direction 2026-11-08: no hand-written parsers or encoders)
 ureq = { version = "2", default-features = false, features = ["tls"] }
 flate2 = "1"
 tar = "0.4"
