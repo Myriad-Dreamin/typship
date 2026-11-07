@@ -708,9 +708,13 @@ fn archive_chain(tmp: &Path) -> Vec<PathBuf> {
 
 /// Locate a subpath inside an extracted archive: try the full relative
 /// path from every candidate root on the single-subdirectory chain
-/// first, then a recursive search as the fallback for archives that
-/// nest deeper. This keeps a `repo-HEAD/` wrapper transparent without
-/// swallowing the repository's own single-child directories.
+/// first, then a segment-wise `find_dir` search from each candidate
+/// root (the first segment is matched among the direct children of a
+/// directory, then the rest below it). There is no arbitrary-depth
+/// search: a subpath whose first segment sits deeper than the candidate
+/// chain will not be found. This keeps a `repo-HEAD/` wrapper
+/// transparent without swallowing the repository's own single-child
+/// directories.
 fn locate_subdir(tmp: &Path, sub: &str) -> Option<PathBuf> {
     let chain = archive_chain(tmp);
     for root in &chain {
@@ -978,7 +982,10 @@ fn latest_from_index_json(text: &str, name: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("package `{name}` not found in registry index"))
 }
 
-/// Find a directory named `rel` anywhere below `root`.
+/// Find a directory at the exact relative path `rel` below `root`, by
+/// matching the first segment among the direct children of a directory
+/// and the rest below it. This is not an arbitrary-depth search: the
+/// first segment must be a direct child at some level of the descent.
 fn find_dir(root: &Path, rel: &str) -> Option<PathBuf> {
     fn walk(dir: &Path, rel: &[&str]) -> Option<PathBuf> {
         if rel.is_empty() {
@@ -2744,6 +2751,24 @@ mod tests {
         );
         let entries = decode_tar(&gz).unwrap();
         assert_eq!(entries[0].path, "real.typ");
+    }
+
+    #[test]
+    fn locate_subdir_has_no_arbitrary_depth_search() {
+        // The contract: only the single-subdirectory chain (up to three
+        // levels) is traversed; a first segment deeper than that is not
+        // found (R5-1 regression, documents the limitation).
+        let base = std::env::temp_dir().join(format!("typship-deep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let deep = base.join("a").join("b").join("c").join("d").join("target");
+        fs::create_dir_all(&deep).unwrap();
+        assert!(locate_subdir(&base, "target").is_none());
+        // Within the chain depth it resolves.
+        assert!(locate_subdir(&base, "a/b/target_placeholder").is_none()); // absent
+        let within = base.join("a").join("b").join("target");
+        fs::create_dir_all(&within).unwrap();
+        assert!(locate_subdir(&base, "b/target").is_some());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
