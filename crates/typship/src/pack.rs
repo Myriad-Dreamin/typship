@@ -1539,7 +1539,7 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
             // wins anyway, so tolerate an undecodable header name there.
             let n = match decode_path(nul_terminated(&header[..100])) {
                 Ok(n) => Some(n),
-                Err(e) if pending_long_name.is_some() => None,
+                Err(_) if pending_long_name.is_some() => None,
                 Err(e) => return Err(e),
             };
             let prefix = decode_path(nul_terminated(&header[345..500]))?;
