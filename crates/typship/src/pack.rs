@@ -1800,12 +1800,14 @@ impl TarWriter {
                 header[..short.len()].copy_from_slice(short.as_bytes());
             }
             None => {
-                // Not splittable into ustar fields: emit a GNU long-name
-                // entry carrying the real name, then the member header.
-                // The fallback header name is a placeholder; cut it at a
-                // UTF-8 character boundary so the reader (which ignores
-                // it in favour of the long name) never sees broken text.
-                self.write_long_name(&name)?;
+                // Not splittable into ustar fields: emit a POSIX PAX
+                // extended header carrying the real path (standard
+                // format, not a GNU private extension), then the member
+                // header. The fallback header name is a placeholder; cut
+                // it at a UTF-8 character boundary so the reader (which
+                // ignores it in favour of the PAX path) never sees
+                // broken text.
+                self.write_pax_path(&name)?;
                 let nb = name.as_bytes();
                 let mut cut = nb.len().min(100);
                 while cut > 0 && (nb[cut] & 0xC0) == 0x80 {
@@ -1822,15 +1824,29 @@ impl TarWriter {
         Ok(())
     }
 
-    /// Emit a GNU long-name (`L`) entry carrying `name`.
-    fn write_long_name(&mut self, name: &str) -> Result<()> {
-        let mut data = name.as_bytes().to_vec();
-        data.push(0);
+    /// Emit a POSIX PAX extended-header entry (`x`) whose `path` record
+    /// carries `name`. The record follows the PAX framing exactly:
+    /// `<len> path=<value>\n`, where `<len>` counts the whole record.
+    fn write_pax_path(&mut self, name: &str) -> Result<()> {
+        // The path value must itself be a valid archive path (no NUL).
+        let body = format!("path={name}\n");
+        // Solve the fixed point: the declared length includes its own
+        // decimal width and the separating space.
+        let mut total = body.len() + 2;
+        loop {
+            let next = total.to_string().len() + 1 + body.len();
+            if next == total {
+                break;
+            }
+            total = next;
+        }
+        let payload = format!("{total} {body}");
+        debug_assert_eq!(payload.len(), total);
         let mut header = [0u8; 512];
         header[..2].copy_from_slice(b"./");
-        self.finish_header(&mut header, b'L', data.len())?;
-        self.out.write_all(&data)?;
-        self.write_padding(data.len())?;
+        self.finish_header(&mut header, b'x', payload.len())?;
+        self.out.write_all(payload.as_bytes())?;
+        self.write_padding(payload.len())?;
         Ok(())
     }
 
@@ -2613,6 +2629,49 @@ mod tests {
     }
 
     #[test]
+    fn writer_creates_no_special_format_entries() {
+        // The writer must only produce regular-file, directory and PAX
+        // extended-header (`x`) entries — never GNU long-name (`L`/
+        // `K`), link, device or other special members (admin review
+        // note: we do not create special-format files).
+        let base = std::env::temp_dir().join(format!("typship-sp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("plain.txt"), "x").unwrap();
+        // A >100-byte unsplittable name forces the extended-header path.
+        let long = format!("{}.typ", "l".repeat(150));
+        fs::write(src.join(&long), "long").unwrap();
+        let gz = pack_tarball(&src).unwrap();
+        // Inspect the uncompressed tar stream's typeflags.
+        let mut raw = Vec::new();
+        MultiGzDecoder::new(&gz[..]).read_to_end(&mut raw).unwrap();
+        let mut flags = Vec::new();
+        let mut pos = 0;
+        while pos + 512 <= raw.len() {
+            let header = &raw[pos..pos + 512];
+            if header.iter().all(|&b| b == 0) {
+                break;
+            }
+            let size = octal(&header[124..136]).unwrap();
+            flags.push(header[156]);
+            pos += 512 + ((size as usize).div_ceil(512)) * 512;
+        }
+        assert!(flags.contains(&b'x'), "PAX header expected: {flags:?}");
+        assert!(!flags.contains(&b'L'), "GNU long-name must not be emitted");
+        assert!(!flags.contains(&b'K'));
+        assert!(
+            flags.iter().all(|f| matches!(f, b'0' | b'5' | b'x')),
+            "{flags:?}"
+        );
+        // The long name still round-trips through the standard PAX path.
+        let dst = base.join("out");
+        extract_tarball(&gz, &dst, None).unwrap();
+        assert_eq!(fs::read(dst.join(&long)).unwrap(), b"long");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn writer_output_roundtrips_through_reader() {
         // The writer's own directory entries (trailing `/`) must be
         // accepted by the reader (R3-1 regression).
@@ -2683,8 +2742,9 @@ mod tests {
         let src = base.join("a");
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("中文.typ"), "hello").unwrap();
-        // Long enough to take the GNU long-name path, and multi-byte so
-        // a byte-truncated fallback header would break decoding.
+        // Long enough to take the PAX extended-header path, and
+        // multi-byte so a byte-truncated fallback header would break
+        // decoding.
         let long = format!("{}.typ", "中".repeat(40));
         fs::write(src.join(&long), "long").unwrap();
         let gz = pack_tarball(&src).unwrap();
