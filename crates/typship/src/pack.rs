@@ -1394,12 +1394,18 @@ fn pax_path(data: &[u8]) -> Result<Option<String>> {
             .ok_or_else(|| anyhow!("malformed PAX record: no length separator"))?;
         let len_str = std::str::from_utf8(&data[pos..pos + rel_sp])
             .map_err(|_| anyhow!("malformed PAX record: length is not ASCII"))?;
+        // Only plain decimal digits: `usize::parse` would accept a `+`.
+        if len_str.is_empty() || !len_str.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("malformed PAX record: bad length `{len_str}`");
+        }
         let len: usize = len_str
             .parse()
             .map_err(|_| anyhow!("malformed PAX record: bad length `{len_str}`"))?;
         // The declared length covers `<len>` + space + body + newline, so
         // it must be at least large enough for the prefix and terminator.
-        if len < rel_sp + 2 || pos + len > data.len() {
+        // Subtraction instead of `pos + len`: a huge declared length must
+        // be an error, never an overflow panic.
+        if len < rel_sp + 2 || len > data.len() - pos {
             bail!("malformed PAX record: length {len} out of bounds");
         }
         let record = &data[pos..pos + len];
@@ -1475,16 +1481,11 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
         if read < 512 {
             bail!("truncated tar header");
         }
-        members_seen += 1;
-        if members_seen > limits.max_entries {
-            bail!(
-                "archive has too many entries (limit {})",
-                limits.max_entries
-            );
-        }
         if header.iter().all(|&b| b == 0) {
-            // First end-of-archive block: tar requires a second one,
-            // then only zero padding within a bounded read.
+            // The end-of-archive blocks themselves do not count against
+            // the member budget. First end-of-archive block: tar
+            // requires a second one, then only zero padding within a
+            // bounded read.
             let mut second = [0u8; 512];
             reader
                 .read_exact(&mut second)
@@ -1506,6 +1507,13 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
             break;
         }
         let stored = octal(&header[148..156])?;
+        members_seen += 1;
+        if members_seen > limits.max_entries {
+            bail!(
+                "archive has too many entries (limit {})",
+                limits.max_entries
+            );
+        }
         let mut sum = 0u64;
         for (i, &b) in header.iter().enumerate() {
             sum += if (148..156).contains(&i) {
@@ -1572,7 +1580,9 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
             }
             b'g' => {
                 // A global PAX header replaces any pending extended
-                // attributes rather than extending them.
+                // attributes rather than extending them; its records are
+                // validated like any other PAX header, then discarded.
+                pax_path(&data)?;
                 pending_pax_path = None;
                 pending_long_name = None;
                 continue;
@@ -1589,10 +1599,13 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
                 bail!("tar member `{name}` is a device or fifo; not supported")
             }
             b'5' => {
-                if let Some(ln) = pending_long_name.take() {
-                    name = ln;
-                } else if let Some(px) = pending_pax_path.take() {
-                    name = px;
+                // Both pending overrides are consumed together (GNU long
+                // name wins if both are present), so neither can leak
+                // into the next member.
+                let gn = pending_long_name.take();
+                let px = pending_pax_path.take();
+                if let Some(override_name) = gn.or(px) {
+                    name = override_name;
                 }
                 entries.push(TarEntry {
                     path: name,
@@ -1601,10 +1614,10 @@ fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
                 });
             }
             b'0' | b'\x00' | b'7' => {
-                if let Some(ln) = pending_long_name.take() {
-                    name = ln;
-                } else if let Some(px) = pending_pax_path.take() {
-                    name = px;
+                let gn = pending_long_name.take();
+                let px = pending_pax_path.take();
+                if let Some(override_name) = gn.or(px) {
+                    name = override_name;
                 }
                 entries.push(TarEntry {
                     path: name,
@@ -2692,7 +2705,7 @@ mod tests {
         assert!(decode_tar(&gz).is_err());
         // A valid first record followed by a malformed one: refused (the
         // whole record set is validated).
-        let payload = b"12 path=ok.typ\n3 junk\n";
+        let payload = b"15 path=ok.typ\n3 junk\n";
         let gz = gz_of_raw(
             &[
                 raw_header(b"p", b'x', payload.len()).to_vec(),
@@ -2731,6 +2744,37 @@ mod tests {
         );
         let entries = decode_tar(&gz).unwrap();
         assert_eq!(entries[0].path, "real.typ");
+    }
+
+    #[test]
+    fn pending_name_overrides_never_leak_to_the_next_member() {
+        // Both a PAX path and a GNU long name pending: the member takes
+        // one name (GNU wins) and BOTH are consumed, so the following
+        // member keeps its own header name (R4-2 regression).
+        let pax_payload = b"14 path=WRONG\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"p", b'x', pax_payload.len()));
+        raw.extend_from_slice(pax_payload);
+        raw.extend_from_slice(&vec![0u8; (512 - (pax_payload.len() % 512)) % 512]);
+        // GNU long-name entry for "good.txt".
+        let mut ln = b"good.txt".to_vec();
+        ln.push(0);
+        raw.extend_from_slice(&raw_header(b"ln", b'L', ln.len()));
+        raw.extend_from_slice(&ln);
+        raw.extend_from_slice(&vec![0u8; (512 - (ln.len() % 512)) % 512]);
+        // The member itself: header name is a placeholder.
+        raw.extend_from_slice(&raw_header(b"placeholder", b'0', 1));
+        raw.extend_from_slice(b"x");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        // A following member with its own plain name.
+        raw.extend_from_slice(&raw_header(b"b.txt", b'0', 1));
+        raw.extend_from_slice(b"y");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        raw.extend_from_slice(&[0u8; 1024]);
+        let entries = decode_tar(&gz_of_raw(&raw)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "good.txt");
+        assert_eq!(entries[1].path, "b.txt");
     }
 
     #[test]
