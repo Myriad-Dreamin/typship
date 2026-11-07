@@ -225,9 +225,7 @@ fn connect(url: &Url, proxy: Option<&Url>, deadline: Instant) -> Result<TcpStrea
                     Err(e) => last = Some(e),
                 }
             }
-            Err(last.unwrap_or_else(|| {
-                std::io::Error::other("host resolved to no addresses")
-            }))
+            Err(last.unwrap_or_else(|| std::io::Error::other("host resolved to no addresses")))
         };
         let _ = tx.send(attempt());
     });
@@ -925,8 +923,7 @@ fn inflate(data: &[u8], out: &mut Vec<u8>) -> Result<()> {
                 }
                 let len = u16::from_le_bytes([data[reader.byte], data[reader.byte + 1]]) as usize;
                 let nlen = u16::from_le_bytes([data[reader.byte + 2], data[reader.byte + 3]]);
-                if u16::from(!len as u8) | (u16::from(!(len >> 8) as u8) << 8) != nlen
-                {
+                if u16::from(!len as u8) | (u16::from(!(len >> 8) as u8) << 8) != nlen {
                     return Err(Error::new("stored DEFLATE block length check failed"));
                 }
                 reader.byte += 4;
