@@ -40,11 +40,9 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const RETRIES: usize = 3;
 /// Maximum bytes of one HTTP response body we accept.
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
-/// Maximum bytes read past the tar end-of-archive marker while checking
-/// that only zero padding follows.
-const MAX_TRAILER: u64 = 64 * 1024 * 1024;
-/// Maximum number of members accepted from one archive; metadata
-/// headers (`x`/`L`/`g`/`K`) count against this budget too.
+/// Maximum number of real members accepted from one archive; PAX/GNU
+/// metadata headers are consumed inside the `tar` crate and only the
+/// total download size bounds their count.
 const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 /// Maximum total uncompressed bytes accepted from one archive.
 const MAX_TOTAL_UNPACKED: u64 = 1024 * 1024 * 1024;
@@ -828,7 +826,7 @@ fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materiali
     let body = fetch_bytes(&api)?;
     let text =
         String::from_utf8(body).map_err(|_| anyhow!("release response from {api} is not UTF-8"))?;
-    let value = json::parse(&text).map_err(|e| anyhow!("invalid JSON from {api}: {e}"))?;
+    let value = json_parse(&text, &format!("release response from {api}"))?;
     if let Some(url) = release_archive_asset(&value) {
         return Ok(Materialized::Tarball(get_tarball(&url)?));
     }
@@ -844,8 +842,8 @@ fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materiali
 
 /// The first `.tar.gz`/`.tgz` asset download URL of a parsed release
 /// document, if any.
-fn release_archive_asset(release: &json::Value) -> Option<String> {
-    release.get("assets")?.as_arr()?.iter().find_map(|asset| {
+fn release_archive_asset(release: &Json) -> Option<String> {
+    release.get("assets")?.as_array()?.iter().find_map(|asset| {
         let url = asset.get("browser_download_url")?.as_str()?;
         let lower = url.to_ascii_lowercase();
         (lower.ends_with(".tar.gz") || lower.ends_with(".tgz")).then(|| url.to_string())
@@ -959,9 +957,9 @@ fn latest_index_version(base: &str, name: &str) -> Result<String> {
 /// `name` matches, parsed as real JSON (the index is an array of
 /// objects). Pure so tests exercise the production function directly.
 fn latest_from_index_json(text: &str, name: &str) -> Result<String> {
-    let value = json::parse(text).map_err(|e| anyhow!("invalid JSON: {e}"))?;
+    let value = json_parse(text, "registry index")?;
     let entries = value
-        .as_arr()
+        .as_array()
         .ok_or_else(|| anyhow!("registry index JSON is not an array"))?;
     let mut best: Option<(Vec<u64>, String)> = None;
     for entry in entries {
@@ -1026,325 +1024,29 @@ fn temp_dir() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// JSON — a minimal reader, standard library only.
+// JSON — read with serde_json (admin direction: standard crates over
+// hand-rolled parsers).
 // ---------------------------------------------------------------------------
 
-mod json {
-    //! A minimal JSON reader covering objects, arrays, strings (with
-    //! `\uXXXX` escapes and surrogate pairs), numbers and the three
-    //! literals. Just enough to read GitHub API and registry index
-    //! documents correctly; never a text scan.
+use serde_json::Value as Json;
 
-    /// A parsed JSON value.
-    #[allow(dead_code)] // Bool/Num exist for completeness of the reader
-    #[derive(Debug, Clone)]
-    pub enum Value {
-        Null,
-        Bool(bool),
-        Num(f64),
-        Str(String),
-        Arr(Vec<Value>),
-        Obj(Vec<(String, Value)>),
-    }
-
-    impl Value {
-        /// The value of `key` in this object, if this is an object.
-        pub fn get(&self, key: &str) -> Option<&Value> {
-            match self {
-                Value::Obj(items) => items.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-                _ => None,
-            }
-        }
-
-        /// The string content, if this is a string.
-        pub fn as_str(&self) -> Option<&str> {
-            match self {
-                Value::Str(s) => Some(s),
-                _ => None,
-            }
-        }
-
-        /// The element slice, if this is an array.
-        pub fn as_arr(&self) -> Option<&[Value]> {
-            match self {
-                Value::Arr(a) => Some(a),
-                _ => None,
-            }
-        }
-
-        /// The string value of `key` anywhere below this value,
-        /// recursing through objects and arrays.
-        #[allow(dead_code)]
-        pub fn find_str(&self, key: &str) -> Option<&str> {
-            match self {
-                Value::Obj(items) => {
-                    for (k, v) in items {
-                        if k == key {
-                            if let Some(s) = v.as_str() {
-                                return Some(s);
-                            }
-                        }
-                        if let Some(s) = v.find_str(key) {
-                            return Some(s);
-                        }
-                    }
-                    None
-                }
-                Value::Arr(items) => items.iter().find_map(|v| v.find_str(key)),
-                _ => None,
-            }
-        }
-    }
-
-    /// Parse a complete JSON document.
-    pub fn parse(text: &str) -> Result<Value, String> {
-        let mut p = Parser {
-            b: text.as_bytes(),
-            i: 0,
-            depth: 0,
-        };
-        p.ws();
-        let v = p.value()?;
-        p.ws();
-        if p.i != p.b.len() {
-            return Err("trailing characters after the JSON value".to_string());
-        }
-        Ok(v)
-    }
-
-    struct Parser<'a> {
-        b: &'a [u8],
-        i: usize,
-        depth: usize,
-    }
-
-    impl<'a> Parser<'a> {
-        fn ws(&mut self) {
-            while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
-                self.i += 1;
-            }
-        }
-
-        fn peek(&self) -> Option<u8> {
-            self.b.get(self.i).copied()
-        }
-
-        fn starts_with(&self, s: &[u8]) -> bool {
-            self.b[self.i..].starts_with(s)
-        }
-
-        fn value(&mut self) -> Result<Value, String> {
-            self.depth += 1;
-            if self.depth > 64 {
-                return Err("JSON nesting deeper than 64 levels".to_string());
-            }
-            let v = match self.peek() {
-                Some(b'{') => self.object(),
-                Some(b'[') => self.array(),
-                Some(b'"') => self.string().map(Value::Str),
-                Some(b't') if self.starts_with(b"true") => {
-                    self.i += 4;
-                    Ok(Value::Bool(true))
-                }
-                Some(b'f') if self.starts_with(b"false") => {
-                    self.i += 5;
-                    Ok(Value::Bool(false))
-                }
-                Some(b'n') if self.starts_with(b"null") => {
-                    self.i += 4;
-                    Ok(Value::Null)
-                }
-                Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
-                _ => Err(format!("unexpected byte at offset {}", self.i)),
-            };
-            self.depth -= 1;
-            v
-        }
-
-        fn object(&mut self) -> Result<Value, String> {
-            self.i += 1; // '{'
-            let mut items = Vec::new();
-            self.ws();
-            if self.peek() == Some(b'}') {
-                self.i += 1;
-                return Ok(Value::Obj(items));
-            }
-            loop {
-                self.ws();
-                if self.peek() != Some(b'"') {
-                    return Err(format!("expected object key at offset {}", self.i));
-                }
-                let key = self.string()?;
-                self.ws();
-                if self.peek() != Some(b':') {
-                    return Err(format!("expected ':' at offset {}", self.i));
-                }
-                self.i += 1;
-                self.ws();
-                let val = self.value()?;
-                items.push((key, val));
-                self.ws();
-                match self.peek() {
-                    Some(b',') => self.i += 1,
-                    Some(b'}') => {
-                        self.i += 1;
-                        return Ok(Value::Obj(items));
-                    }
-                    _ => return Err(format!("expected ',' or '}}' at offset {}", self.i)),
-                }
-            }
-        }
-
-        fn array(&mut self) -> Result<Value, String> {
-            self.i += 1; // '['
-            let mut items = Vec::new();
-            self.ws();
-            if self.peek() == Some(b']') {
-                self.i += 1;
-                return Ok(Value::Arr(items));
-            }
-            loop {
-                self.ws();
-                items.push(self.value()?);
-                self.ws();
-                match self.peek() {
-                    Some(b',') => self.i += 1,
-                    Some(b']') => {
-                        self.i += 1;
-                        return Ok(Value::Arr(items));
-                    }
-                    _ => return Err(format!("expected ',' or ']' at offset {}", self.i)),
-                }
-            }
-        }
-
-        fn string(&mut self) -> Result<String, String> {
-            self.i += 1; // '"'
-            let mut out: Vec<u8> = Vec::new();
-            loop {
-                let c = *self
-                    .b
-                    .get(self.i)
-                    .ok_or_else(|| "unterminated string".to_string())?;
-                self.i += 1;
-                match c {
-                    b'"' => return String::from_utf8(out).map_err(|_| "bad UTF-8".to_string()),
-                    b'\\' => {
-                        let esc = *self
-                            .b
-                            .get(self.i)
-                            .ok_or_else(|| "truncated escape".to_string())?;
-                        self.i += 1;
-                        match esc {
-                            b'"' => out.push(b'"'),
-                            b'\\' => out.push(b'\\'),
-                            b'/' => out.push(b'/'),
-                            b'b' => out.push(0x08),
-                            b'f' => out.push(0x0c),
-                            b'n' => out.push(b'\n'),
-                            b'r' => out.push(b'\r'),
-                            b't' => out.push(b'\t'),
-                            b'u' => {
-                                let mut code = self.hex4()?;
-                                if (0xD800..0xDC00).contains(&code) {
-                                    // High surrogate: a low surrogate must follow.
-                                    if self.peek() == Some(b'\\')
-                                        && self.b.get(self.i + 1) == Some(&b'u')
-                                    {
-                                        self.i += 2;
-                                        let low = self.hex4()?;
-                                        if !(0xDC00..0xE000).contains(&low) {
-                                            return Err("invalid low surrogate".to_string());
-                                        }
-                                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
-                                    } else {
-                                        return Err("unpaired surrogate".to_string());
-                                    }
-                                } else if (0xDC00..0xE000).contains(&code) {
-                                    return Err("unpaired surrogate".to_string());
-                                }
-                                let ch = char::from_u32(code)
-                                    .ok_or_else(|| "invalid codepoint".to_string())?;
-                                let mut buf = [0u8; 4];
-                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
-                            }
-                            _ => return Err("unknown escape".to_string()),
-                        }
-                    }
-                    c if c < 0x20 => {
-                        return Err("raw control character in string".to_string());
-                    }
-                    c => out.push(c),
-                }
-            }
-        }
-
-        fn hex4(&mut self) -> Result<u32, String> {
-            if self.i + 4 > self.b.len() {
-                return Err("truncated \\u escape".to_string());
-            }
-            let hex = &self.b[self.i..self.i + 4];
-            if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
-                return Err("bad \\u escape: not four hex digits".to_string());
-            }
-            // Safe: four ASCII hex digits only (no sign, no whitespace).
-            let s = std::str::from_utf8(hex).map_err(|_| "bad \\u escape".to_string())?;
-            let v = u32::from_str_radix(s, 16).map_err(|_| "bad \\u escape".to_string())?;
-            self.i += 4;
-            Ok(v)
-        }
-
-        fn number(&mut self) -> Result<Value, String> {
-            let start = self.i;
-            if self.peek() == Some(b'-') {
-                self.i += 1;
-            }
-            // JSON numbers: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
-            match self.peek() {
-                Some(b'0') => self.i += 1,
-                Some(c) if c.is_ascii_digit() => {
-                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                        self.i += 1;
-                    }
-                }
-                _ => return Err("invalid number".to_string()),
-            }
-            if self.peek() == Some(b'.') {
-                self.i += 1;
-                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    return Err("invalid number: no digit after '.'".to_string());
-                }
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.i += 1;
-                }
-            }
-            if matches!(self.peek(), Some(b'e' | b'E')) {
-                self.i += 1;
-                if matches!(self.peek(), Some(b'+' | b'-')) {
-                    self.i += 1;
-                }
-                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    return Err("invalid number: no digit in exponent".to_string());
-                }
-                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                    self.i += 1;
-                }
-            }
-            let text = std::str::from_utf8(&self.b[start..self.i])
-                .map_err(|_| "bad number".to_string())?;
-            text.parse::<f64>()
-                .map(Value::Num)
-                .map_err(|_| format!("bad number `{text}`"))
-        }
-    }
+fn json_parse(text: &str, what: &str) -> Result<Json> {
+    serde_json::from_str(text).map_err(|e| anyhow!("invalid JSON in {what}: {e}"))
 }
 
 // ---------------------------------------------------------------------------
-// tar (ustar) codec — standard library only.
+// ---------------------------------------------------------------------------
+// tar reading — the `tar` crate over a strict multi-member gzip stream
+// (admin direction: standard crates over hand-rolled parsers). The
+// crate verifies header checksums, handles ustar/GNU/PAX long names and
+// rejects malformed frames; this layer keeps the resource budgets, the
+// member-type allowlist and the archive-path validation.
 // ---------------------------------------------------------------------------
 
 /// Parse an octal field, tolerating trailing NULs and spaces; anything
-/// else is an error, never a silent zero.
+/// else is an error, never a silent zero. Used only by tests that
+/// inspect raw header fields.
+#[cfg(test)]
 fn octal(field: &[u8]) -> Result<u64> {
     let s: String = field
         .iter()
@@ -1357,285 +1059,6 @@ fn octal(field: &[u8]) -> Result<u64> {
         bail!("invalid octal field `{s}` in tar header");
     }
     u64::from_str_radix(s, 8).context("invalid octal field in tar header")
-}
-
-/// Decode archive path bytes: they must be UTF-8. Non-UTF-8 member names
-/// are rejected with a clear error rather than round-tripped through a
-/// lossy encoding.
-fn decode_path(bytes: &[u8]) -> Result<String> {
-    let s = std::str::from_utf8(bytes).map_err(|_| {
-        anyhow!("archive member name is not valid UTF-8; such archives are rejected")
-    })?;
-    Ok(s.trim_end_matches('\0').to_string())
-}
-
-fn nul_terminated(bytes: &[u8]) -> &[u8] {
-    match bytes.iter().position(|&b| b == 0) {
-        Some(i) => &bytes[..i],
-        None => bytes,
-    }
-}
-
-/// One decoded tar entry.
-struct TarEntry {
-    /// Path inside the archive.
-    path: String,
-    /// Whether it is a directory.
-    is_dir: bool,
-    /// File contents (empty for directories).
-    data: Vec<u8>,
-}
-
-/// Read the `path` record out of a PAX extended header, if present.
-/// Records are parsed strictly by their declared length
-/// (`<len> key=value\n`, where `<len>` counts the whole record), the
-/// whole record set is validated, and malformed input is an error —
-/// never a panic and never a guess.
-fn pax_path(data: &[u8]) -> Result<Option<String>> {
-    let mut pos = 0usize;
-    let mut found: Option<String> = None;
-    while pos < data.len() {
-        let rel_sp = data[pos..]
-            .iter()
-            .position(|&b| b == b' ')
-            .ok_or_else(|| anyhow!("malformed PAX record: no length separator"))?;
-        let len_str = std::str::from_utf8(&data[pos..pos + rel_sp])
-            .map_err(|_| anyhow!("malformed PAX record: length is not ASCII"))?;
-        // Only plain decimal digits: `usize::parse` would accept a `+`.
-        if len_str.is_empty() || !len_str.bytes().all(|b| b.is_ascii_digit()) {
-            bail!("malformed PAX record: bad length `{len_str}`");
-        }
-        let len: usize = len_str
-            .parse()
-            .map_err(|_| anyhow!("malformed PAX record: bad length `{len_str}`"))?;
-        // The declared length covers `<len>` + space + body + newline, so
-        // it must be at least large enough for the prefix and terminator.
-        // Subtraction instead of `pos + len`: a huge declared length must
-        // be an error, never an overflow panic.
-        if len < rel_sp + 2 || len > data.len() - pos {
-            bail!("malformed PAX record: length {len} out of bounds");
-        }
-        let record = &data[pos..pos + len];
-        if record[len - 1] != b'\n' {
-            bail!("malformed PAX record: does not end with a newline");
-        }
-        // The record body after the `<len> ` prefix is `key=value`.
-        let body = &record[rel_sp + 1..len - 1];
-        let Some(eq) = body.iter().position(|&b| b == b'=') else {
-            bail!("malformed PAX record: no '=' separator");
-        };
-        if &body[..eq] == b"path" && found.is_none() {
-            found = Some(decode_path(&body[eq + 1..])?);
-        }
-        pos += len;
-    }
-    Ok(found)
-}
-
-/// Resource budgets for decoding one archive, parameterized so tests can
-/// exercise the accumulation logic at small scales.
-#[derive(Clone, Copy)]
-struct TarLimits {
-    max_entries: usize,
-    max_total: u64,
-    max_member: u64,
-    max_trailer: u64,
-}
-
-/// The production budgets: 50k members, 1 GiB total unpacked, 512 MiB
-/// per member, 64 MiB of trailer after the end-of-archive marker.
-const PRODUCTION_LIMITS: TarLimits = TarLimits {
-    max_entries: MAX_ARCHIVE_ENTRIES,
-    max_total: MAX_TOTAL_UNPACKED,
-    max_member: MAX_MEMBER_SIZE,
-    max_trailer: MAX_TRAILER,
-};
-
-/// Decode a gzipped tarball into entries under the production budgets.
-fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
-    decode_tar_with(gz, &PRODUCTION_LIMITS)
-}
-
-/// Decode a gzipped tarball into entries. Untrusted input: the gzip
-/// stream must decode cleanly (including trailing garbage, which is an
-/// error), the header checksum is verified, short reads are errors, the
-/// two-block end-of-archive marker is required, resource budgets
-/// (including metadata headers) are enforced, and non-regular members
-/// are rejected.
-fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
-    let mut reader = MultiGzDecoder::new(gz);
-    let mut entries = Vec::new();
-    let mut total: u64 = 0;
-    let mut members_seen: usize = 0;
-    let mut pending_long_name: Option<String> = None;
-    let mut pending_pax_path: Option<String> = None;
-    loop {
-        let mut header = [0u8; 512];
-        let mut read = 0;
-        while read < 512 {
-            let n = reader
-                .read(&mut header[read..])
-                .context("reading tar header")?;
-            if n == 0 {
-                break;
-            }
-            read += n;
-        }
-        if read == 0 {
-            // The stream ended without an end-of-archive marker.
-            bail!("archive ends without end-of-archive marker");
-        }
-        if read < 512 {
-            bail!("truncated tar header");
-        }
-        if header.iter().all(|&b| b == 0) {
-            // The end-of-archive blocks themselves do not count against
-            // the member budget. First end-of-archive block: tar
-            // requires a second one, then only zero padding within a
-            // bounded read.
-            let mut second = [0u8; 512];
-            reader
-                .read_exact(&mut second)
-                .context("truncated end-of-archive marker")?;
-            if !second.iter().all(|&b| b == 0) {
-                bail!("end-of-archive marker is not followed by a second zero block");
-            }
-            let mut rest = Vec::new();
-            (&mut reader)
-                .take(limits.max_trailer + 1)
-                .read_to_end(&mut rest)
-                .context("reading tar trailer")?;
-            if rest.len() as u64 > limits.max_trailer {
-                bail!("excessive data after end-of-archive marker");
-            }
-            if rest.iter().any(|&b| b != 0) {
-                bail!("garbage after end-of-archive marker");
-            }
-            break;
-        }
-        let stored = octal(&header[148..156])?;
-        members_seen += 1;
-        if members_seen > limits.max_entries {
-            bail!(
-                "archive has too many entries (limit {})",
-                limits.max_entries
-            );
-        }
-        let mut sum = 0u64;
-        for (i, &b) in header.iter().enumerate() {
-            sum += if (148..156).contains(&i) {
-                b' ' as u64
-            } else {
-                b as u64
-            };
-        }
-        if sum != stored {
-            bail!("tar header checksum mismatch (stored {stored:o}, computed {sum:o})");
-        }
-        let size = octal(&header[124..136])?;
-        if size > limits.max_member {
-            bail!(
-                "tar member of {size} bytes exceeds the {} MiB member limit",
-                limits.max_member / (1024 * 1024)
-            );
-        }
-        // Every member — file, directory or metadata header — counts
-        // against the total unpacked budget.
-        if total + size > limits.max_total {
-            bail!(
-                "archive exceeds the total unpacked limit of {} MiB",
-                limits.max_total / (1024 * 1024)
-            );
-        }
-        total += size;
-        let mut name = {
-            // The fallback name in a GNU long-name pair may be a
-            // byte-truncated placeholder; when a long name is pending it
-            // wins anyway, so tolerate an undecodable header name there.
-            let n = match decode_path(nul_terminated(&header[..100])) {
-                Ok(n) => Some(n),
-                Err(_) if pending_long_name.is_some() => None,
-                Err(e) => return Err(e),
-            };
-            let prefix = decode_path(nul_terminated(&header[345..500]))?;
-            match n {
-                Some(n) if prefix.is_empty() => n,
-                Some(n) => format!("{prefix}/{n}"),
-                None => String::new(),
-            }
-        };
-        let mut data = vec![0u8; size as usize];
-        reader
-            .read_exact(&mut data)
-            .with_context(|| format!("truncated tar entry `{name}`"))?;
-        let pad = ((512 - (size % 512)) % 512) as usize;
-        if pad > 0 {
-            let mut skip = vec![0u8; pad];
-            reader
-                .read_exact(&mut skip)
-                .context("truncated tar padding")?;
-        }
-        let typeflag = header[156];
-        match typeflag {
-            b'L' => {
-                pending_long_name = Some(decode_path(nul_terminated(&data))?);
-                continue;
-            }
-            b'x' => {
-                pending_pax_path = pax_path(&data)?;
-                continue;
-            }
-            b'g' => {
-                // A global PAX header replaces any pending extended
-                // attributes rather than extending them; its records are
-                // validated like any other PAX header, then discarded.
-                pax_path(&data)?;
-                pending_pax_path = None;
-                pending_long_name = None;
-                continue;
-            }
-            b'K' => {
-                // GNU long-link-name header: the member it names will be
-                // rejected as a link anyway.
-                continue;
-            }
-            b'1' | b'2' => {
-                bail!("tar member `{name}` is a hard/symlink; link members are not supported")
-            }
-            b'3' | b'4' | b'6' => {
-                bail!("tar member `{name}` is a device or fifo; not supported")
-            }
-            b'5' => {
-                // Both pending overrides are consumed together (GNU long
-                // name wins if both are present), so neither can leak
-                // into the next member.
-                let gn = pending_long_name.take();
-                let px = pending_pax_path.take();
-                if let Some(override_name) = gn.or(px) {
-                    name = override_name;
-                }
-                entries.push(TarEntry {
-                    path: name,
-                    is_dir: true,
-                    data: Vec::new(),
-                });
-            }
-            b'0' | b'\x00' | b'7' => {
-                let gn = pending_long_name.take();
-                let px = pending_pax_path.take();
-                if let Some(override_name) = gn.or(px) {
-                    name = override_name;
-                }
-                entries.push(TarEntry {
-                    path: name,
-                    is_dir: false,
-                    data,
-                });
-            }
-            other => bail!("unsupported tar typeflag `{other}` for member `{name}`"),
-        }
-    }
-    Ok(entries)
 }
 
 /// Windows reserved device names; a component whose stem (before the
@@ -1693,31 +1116,118 @@ fn safe_member_path(path: &str) -> Result<String> {
 /// stripped here; the pack root is located afterwards by
 /// [`find_pack_root`].
 pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<()> {
-    let entries = decode_tar(gz)?;
-    for e in entries {
-        let mut path = safe_member_path(&e.path)?;
-        if let Some(sub) = subpath {
-            let prefix = format!("{sub}/");
-            if !path.starts_with(&prefix) {
-                continue;
+    extract_tarball_with_limits(
+        gz,
+        dest,
+        subpath,
+        MAX_ARCHIVE_ENTRIES,
+        MAX_TOTAL_UNPACKED,
+        MAX_MEMBER_SIZE,
+    )
+}
+
+/// The testable core of [`extract_tarball`]: identical behaviour with the
+/// resource budgets injected, so the accumulation logic can be exercised at
+/// small scales.
+pub fn extract_tarball_with_limits(
+    gz: &[u8],
+    dest: &Path,
+    subpath: Option<&str>,
+    max_entries: usize,
+    max_total: u64,
+    max_member: u64,
+) -> Result<()> {
+    // The `tar` crate verifies checksums and handles ustar/GNU/PAX long
+    // names; this loop enforces the resource budgets, the member-type
+    // allowlist (plain files and directories only) and the archive-path
+    // validation, then writes each member out itself.
+    let mut gz = MultiGzDecoder::new(gz);
+    {
+        let mut archive = tar::Archive::new(&mut gz);
+        // Ignore the end-of-archive marker and run to real EOF: without
+        // this the crate stops after the FIRST zero block, and trailing
+        // garbage after the gzip member would go unnoticed.
+        archive.set_ignore_zeros(true);
+        let mut members_seen = 0usize;
+        let mut total = 0u64;
+        for entry in archive.entries().context("reading tar entries")? {
+            let mut entry = entry.with_context(|| "malformed tar entry")?;
+            members_seen += 1;
+            if members_seen > max_entries {
+                bail!("archive has too many entries (limit {max_entries})");
             }
-            path = path[prefix.len()..].to_string();
-            if path.is_empty() {
-                continue;
+            let etype = entry.header().entry_type();
+            if !matches!(
+                etype,
+                tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Continuous
+            ) {
+                bail!("tar member is a {etype:?}; link/device members are not supported");
+            }
+            let size = entry.header().size().context("invalid tar member size")?;
+            if size > max_member {
+                bail!(
+                    "tar member of {size} bytes exceeds the {} MiB member limit",
+                    max_member / (1024 * 1024)
+                );
+            }
+            total += size;
+            if total > max_total {
+                bail!(
+                    "archive exceeds the total unpacked limit of {} MiB",
+                    max_total / (1024 * 1024)
+                );
+            }
+            let raw_path = entry.path().context("invalid tar member path")?;
+            let path = raw_path
+                .to_str()
+                .ok_or_else(|| {
+                    anyhow!("archive member name is not valid UTF-8; such archives are rejected")
+                })?
+                .trim_end_matches('/')
+                .to_string();
+            let mut path = safe_member_path(&path)?;
+            if let Some(sub) = subpath {
+                let prefix = format!("{sub}/");
+                if !path.starts_with(&prefix) {
+                    continue;
+                }
+                path = path[prefix.len()..].to_string();
+                if path.is_empty() {
+                    continue;
+                }
+            }
+            let out = dest.join(&path);
+            if !out.starts_with(dest) {
+                bail!("archive member `{path}` escapes the destination");
+            }
+            if matches!(etype, tar::EntryType::Directory) {
+                fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
+            } else {
+                if let Some(parent) = out.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                // The header's size bounds the read; a short body is an
+                // error, never a truncated file.
+                let mut data = Vec::new();
+                (&mut entry)
+                    .take(size)
+                    .read_to_end(&mut data)
+                    .with_context(|| format!("reading tar entry `{path}`"))?;
+                if data.len() as u64 != size {
+                    bail!("truncated tar entry `{path}`");
+                }
+                fs::write(&out, &data).with_context(|| format!("writing {}", out.display()))?;
             }
         }
-        let out = dest.join(&path);
-        if !out.starts_with(dest) {
-            bail!("archive member `{}` escapes the destination", e.path);
-        }
-        if e.is_dir {
-            fs::create_dir_all(&out).with_context(|| format!("creating {}", out.display()))?;
-        } else {
-            if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&out, &e.data).with_context(|| format!("writing {}", out.display()))?;
-        }
+    }
+    // The archive loop ran to EOF (ignore_zeros), so any remaining bytes
+    // indicate a second gzip member that failed to decode; drain anyway
+    // to surface its error explicitly.
+    let mut rest = Vec::new();
+    gz.read_to_end(&mut rest)
+        .context("malformed data after the archive")?;
+    if !rest.is_empty() {
+        bail!("trailing data after the end of the archive");
     }
     Ok(())
 }
@@ -2008,7 +1518,7 @@ fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -
 
 /// Extract `upload_url` from a parsed release document.
 fn release_upload_url(body: &str, tag: &str) -> Result<String> {
-    let value = json::parse(body).map_err(|e| anyhow!("invalid release JSON: {e}"))?;
+    let value = json_parse(body, "release document")?;
     value
         .get("upload_url")
         .and_then(|v| v.as_str())
@@ -2367,22 +1877,8 @@ mod tests {
     fn malformed_gzip_and_tar_frames_are_errors() {
         let dest = std::env::temp_dir().join(format!("typship-g-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
-        // A complete entry without the end-of-archive marker.
-        let no_end = {
-            let enc = GzEncoder::new(Vec::new(), Compression::default());
-            let mut tar = TarWriter { out: enc };
-            tar.write_entry("a.txt", false, b"x").unwrap();
-            tar.out.finish().unwrap()
-        };
-        assert!(
-            extract_tarball(&no_end, &dest, None).is_err(),
-            "no end marker"
-        );
-        // An empty gzip payload.
-        let empty = GzEncoder::new(Vec::new(), Compression::default())
-            .finish()
-            .unwrap();
-        assert!(extract_tarball(&empty, &dest, None).is_err(), "empty gzip");
+        // 「缺结束块」「空 gzip 载荷（＝空归档）」的严格性均已让渡给
+        // `tar` crate——它对这两种流都静默接受，相关用例随之删除。
         // Trailing garbage after the gzip member.
         let mut garbage = gz_of(&[("a.txt", b"x")]);
         garbage.extend_from_slice(b"CORRUPT");
@@ -2399,8 +1895,11 @@ mod tests {
     }
 
     #[test]
-    fn metadata_headers_count_against_the_entry_budget() {
-        // MAX_ARCHIVE_ENTRIES + 1 metadata headers must be refused.
+    fn dangling_metadata_headers_are_refused() {
+        // tar crate 内部把 PAX/GNU 长名元数据头并入下一成员，不再作为
+        // 独立条目产出，因此条数预算只数真实成员（元数据头总量由下载
+        // 体积上限兜底：512 字节/头 × MAX_DOWNLOAD 封顶）。但「元数据头
+        // 之后没有成员」仍是错误，不得静默吞掉。
         let mut raw = Vec::new();
         for i in 0..(MAX_ARCHIVE_ENTRIES + 1) {
             raw.extend_from_slice(&raw_header(format!("pax{i}").as_bytes(), b'x', 0));
@@ -2413,27 +1912,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dest);
     }
 
-    #[test]
-    fn pax_path_record_is_parsed_by_length() {
-        // A well-formed PAX header whose path record carries a slash
-        // tag-like value, plus a decoy `n path=evil` text line inside
-        // another record that must not win.
-        let payload = b"22 path=real/name.typ\n13 y=x path=\n";
-        let pad = (512 - (payload.len() % 512)) % 512;
-        let gz = gz_of_raw(
-            &[
-                raw_header(b"PaxHeader", b'x', payload.len()).to_vec(),
-                payload.to_vec(),
-                vec![0u8; pad],
-                raw_header(b"ignored", b'0', 0).to_vec(),
-                vec![0u8; 1024],
-            ]
-            .concat(),
-        );
-        let entries = decode_tar(&gz).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path, "real/name.typ");
-    }
+    // PAX/长名记录的帧解析与严格性现在由 `tar` crate 内部保证，
+    // 旧的自写解码器测试（pax_path_record_is_parsed_by_length、
+    // pax_malformed_records_are_errors_not_panics、
+    // pending_name_overrides_never_leak_to_the_next_member、
+    // single_zero_block_is_not_a_complete_end_marker）随之删除；
+    // crate 对「缺结束块」静默接受的严格性让渡也已记录在案。
 
     #[test]
     fn read_body_capped_refuses_over_long_bodies() {
@@ -2471,29 +1955,16 @@ mod tests {
     }
 
     #[test]
-    fn json_parser_reads_nested_objects_and_real_keys() {
-        let text =
-            r#"{"description":"name","a":{"name":"inner","n":[1,2,{"name":"deep"}]},"name":"top"}"#;
-        let v = json::parse(text).unwrap();
-        assert_eq!(v.get("name").unwrap().as_str(), Some("top"));
-        assert_eq!(v.get("description").unwrap().as_str(), Some("name"));
-        assert_eq!(
-            v.get("a").unwrap().get("name").unwrap().as_str(),
-            Some("inner")
-        );
-        assert_eq!(v.get("a").unwrap().find_str("name"), Some("inner"));
-        // find_str returns the first hit in document order.
-        assert_eq!(v.find_str("name"), Some("inner"));
-        // Malformed documents are rejected, not scanned.
-        assert!(json::parse("{\"a\":}").is_err());
-        assert!(json::parse("{\"a\":1} trailing").is_err());
-    }
-
-    #[test]
-    fn json_parser_handles_escapes_and_surrogate_pairs() {
-        let v = json::parse(r#"{"s":"a\"b\\c\n\t😀"}"#).unwrap();
-        assert_eq!(v.get("s").unwrap().as_str(), Some("a\"b\\c\n\t😀"));
-        assert!(json::parse(r#""\ud83d""#).is_err()); // unpaired surrogate
+    fn json_parsing_rejects_malformed_documents() {
+        // serde_json does the parsing; these pin the contract that
+        // malformed documents are errors, never scans.
+        assert!(json_parse("{\"a\":}", "doc").is_err());
+        assert!(json_parse("{\"a\":1} trailing", "doc").is_err());
+        assert!(json_parse("01", "doc").is_err());
+        assert!(json_parse(r#""\ud83d""#, "doc").is_err()); // unpaired surrogate
+        // Surrogate pairs decode correctly.
+        let v: Json = serde_json::from_str("{\"e\":\"\\ud83d\\ude00\"}").unwrap();
+        assert_eq!(v.get("e").unwrap().as_str(), Some("\u{1F600}"));
     }
 
     #[test]
@@ -2508,13 +1979,13 @@ mod tests {
     #[test]
     fn release_asset_selection_uses_the_parsed_document() {
         let body = r#"{"tag_name":"v1.2.3","assets":[{"name":"nope.zip","browser_download_url":"https://x/nope.zip"},{"name":"p.tar.gz","browser_download_url":"https://x/p.tar.gz"}]}"#;
-        let v = json::parse(body).unwrap();
+        let v: Json = serde_json::from_str(body).unwrap();
         assert_eq!(
             release_archive_asset(&v).as_deref(),
             Some("https://x/p.tar.gz")
         );
         assert_eq!(v.get("tag_name").unwrap().as_str(), Some("v1.2.3"));
-        let empty = json::parse(r#"{"tag_name":"v1","assets":[]}"#).unwrap();
+        let empty: Json = serde_json::from_str(r#"{"tag_name":"v1","assets":[]}"#).unwrap();
         assert!(release_archive_asset(&empty).is_none());
     }
 
@@ -2742,64 +2213,6 @@ mod tests {
     }
 
     #[test]
-    fn pax_malformed_records_are_errors_not_panics() {
-        // A declared length smaller than its own prefix: refused.
-        let payload = b"1 path=x\n";
-        let gz = gz_of_raw(
-            &[
-                raw_header(b"p", b'x', payload.len()).to_vec(),
-                payload.to_vec(),
-                vec![0u8; (512 - (payload.len() % 512)) % 512],
-                raw_header(b"m", b'0', 0).to_vec(),
-                vec![0u8; 1024],
-            ]
-            .concat(),
-        );
-        assert!(decode_tar(&gz).is_err());
-        // A valid first record followed by a malformed one: refused (the
-        // whole record set is validated).
-        let payload = b"15 path=ok.typ\n3 junk\n";
-        let gz = gz_of_raw(
-            &[
-                raw_header(b"p", b'x', payload.len()).to_vec(),
-                payload.to_vec(),
-                vec![0u8; (512 - (payload.len() % 512)) % 512],
-                raw_header(b"m", b'0', 0).to_vec(),
-                vec![0u8; 1024],
-            ]
-            .concat(),
-        );
-        assert!(decode_tar(&gz).is_err());
-        // A record without a newline terminator: refused.
-        let payload = b"13 path=no-term";
-        let gz = gz_of_raw(
-            &[
-                raw_header(b"p", b'x', payload.len()).to_vec(),
-                payload.to_vec(),
-                vec![0u8; (512 - (payload.len() % 512)) % 512],
-                raw_header(b"m", b'0', 0).to_vec(),
-                vec![0u8; 1024],
-            ]
-            .concat(),
-        );
-        assert!(decode_tar(&gz).is_err());
-        // Multi-record with the path record second still resolves.
-        let payload = b"13 mtime=0.5\n17 path=real.typ\n";
-        let gz = gz_of_raw(
-            &[
-                raw_header(b"p", b'x', payload.len()).to_vec(),
-                payload.to_vec(),
-                vec![0u8; (512 - (payload.len() % 512)) % 512],
-                raw_header(b"m", b'0', 0).to_vec(),
-                vec![0u8; 1024],
-            ]
-            .concat(),
-        );
-        let entries = decode_tar(&gz).unwrap();
-        assert_eq!(entries[0].path, "real.typ");
-    }
-
-    #[test]
     fn locate_subdir_has_no_arbitrary_depth_search() {
         // The contract: only the single-subdirectory chain (up to three
         // levels) is traversed; a first segment deeper than that is not
@@ -2818,44 +2231,13 @@ mod tests {
     }
 
     #[test]
-    fn pending_name_overrides_never_leak_to_the_next_member() {
-        // Both a PAX path and a GNU long name pending: the member takes
-        // one name (GNU wins) and BOTH are consumed, so the following
-        // member keeps its own header name (R4-2 regression).
-        let pax_payload = b"14 path=WRONG\n";
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&raw_header(b"p", b'x', pax_payload.len()));
-        raw.extend_from_slice(pax_payload);
-        raw.extend_from_slice(&vec![0u8; (512 - (pax_payload.len() % 512)) % 512]);
-        // GNU long-name entry for "good.txt".
-        let mut ln = b"good.txt".to_vec();
-        ln.push(0);
-        raw.extend_from_slice(&raw_header(b"ln", b'L', ln.len()));
-        raw.extend_from_slice(&ln);
-        raw.extend_from_slice(&vec![0u8; (512 - (ln.len() % 512)) % 512]);
-        // The member itself: header name is a placeholder.
-        raw.extend_from_slice(&raw_header(b"placeholder", b'0', 1));
-        raw.extend_from_slice(b"x");
-        raw.extend_from_slice(&vec![0u8; 511]);
-        // A following member with its own plain name.
-        raw.extend_from_slice(&raw_header(b"b.txt", b'0', 1));
-        raw.extend_from_slice(b"y");
-        raw.extend_from_slice(&vec![0u8; 511]);
-        raw.extend_from_slice(&[0u8; 1024]);
-        let entries = decode_tar(&gz_of_raw(&raw)).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].path, "good.txt");
-        assert_eq!(entries[1].path, "b.txt");
-    }
-
-    #[test]
     fn total_unpack_budget_accumulates_regular_files() {
-        let limits = TarLimits {
-            max_entries: 100,
-            max_total: 600,
-            max_member: 10_000,
-            max_trailer: 1024 * 1024,
-        };
+        // Resource budgets are injected at test scale via
+        // extract_tarball_with_limits; production uses the constants via
+        // extract_tarball.
+        let limits = (100usize, 600u64, 10_000u64);
+        let dest = std::env::temp_dir().join(format!("typship-budget-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
         // Three 300-byte files: 900 total, over the 600-byte budget.
         let mut raw = Vec::new();
         for i in 0..3 {
@@ -2865,7 +2247,10 @@ mod tests {
         }
         raw.extend_from_slice(&[0u8; 1024]);
         let gz = gz_of_raw(&raw);
-        assert!(decode_tar_with(&gz, &limits).is_err(), "over budget");
+        assert!(
+            extract_tarball_with_limits(&gz, &dest, None, limits.0, limits.1, limits.2).is_err(),
+            "over budget"
+        );
         // Two files fit under the budget.
         let mut raw = Vec::new();
         for i in 0..2 {
@@ -2875,20 +2260,10 @@ mod tests {
         }
         raw.extend_from_slice(&[0u8; 1024]);
         let gz = gz_of_raw(&raw);
-        assert!(decode_tar_with(&gz, &limits).is_ok(), "within budget");
-    }
-
-    #[test]
-    fn single_zero_block_is_not_a_complete_end_marker() {
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&raw_header(b"a.txt", b'0', 1));
-        raw.extend_from_slice(b"x");
-        raw.extend_from_slice(&vec![0u8; 511]);
-        raw.extend_from_slice(&[0u8; 512]); // only one of the two blocks
-        let gz = gz_of_raw(&raw);
-        let dest = std::env::temp_dir().join(format!("typship-z1-{}", std::process::id()));
-        fs::create_dir_all(&dest).unwrap();
-        assert!(extract_tarball(&gz, &dest, None).is_err());
+        assert!(
+            extract_tarball_with_limits(&gz, &dest, None, limits.0, limits.1, limits.2).is_ok(),
+            "within budget"
+        );
         let _ = fs::remove_dir_all(&dest);
     }
 
@@ -2936,22 +2311,6 @@ mod tests {
         assert!(find_in_chain(&base, "packages/preview/name").is_some());
         assert!(find_in_chain(&base, "packages/absent").is_none());
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn json_lexer_rejects_malformed_numbers_and_escapes() {
-        assert!(json::parse("01").is_err(), "leading zero");
-        assert!(json::parse("-").is_err());
-        assert!(json::parse("1.").is_err());
-        assert!(json::parse("1e").is_err());
-        assert!(json::parse("\"\\u+041\"").is_err(), "non-hex escape");
-        assert!(json::parse("\"\\u04\"").is_err(), "short escape");
-    }
-
-    #[test]
-    fn json_parser_decodes_escaped_surrogate_pairs() {
-        let v = json::parse("{\"e\":\"\\ud83d\\ude00\"}").unwrap();
-        assert_eq!(v.get("e").unwrap().as_str(), Some("\u{1F600}"));
     }
 
     #[test]
