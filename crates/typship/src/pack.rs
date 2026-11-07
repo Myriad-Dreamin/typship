@@ -1121,18 +1121,32 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
     let mut gz = MultiGzDecoder::new(gz);
     {
         let mut archive = tar::Archive::new(&mut gz);
-        // Ignore the end-of-archive marker and run to real EOF: without
-        // this the crate stops after the FIRST zero block, and trailing
-        // garbage after the gzip member would go unnoticed.
-        archive.set_ignore_zeros(true);
         for entry in archive.entries().context("reading tar entries")? {
             let mut entry = entry.with_context(|| "malformed tar entry")?;
             let etype = entry.header().entry_type();
             if !matches!(
                 etype,
-                tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Continuous
+                tar::EntryType::Regular
+                    | tar::EntryType::Directory
+                    | tar::EntryType::Continuous
+                    | tar::EntryType::XGlobalHeader
             ) {
                 bail!("tar member is a {etype:?}; link/device members are not supported");
+            }
+            // The crate's own PAX lookups (path, size) silently drop
+            // malformed records; validate every record explicitly.
+            if let Some(exts) = entry
+                .pax_extensions()
+                .with_context(|| "malformed PAX records in archive")?
+            {
+                for record in exts {
+                    record.with_context(|| "malformed PAX record in archive")?;
+                }
+            }
+            // A global PAX header carries defaults this reader does not
+            // apply: validate its records above, then skip it entirely.
+            if etype == tar::EntryType::XGlobalHeader {
+                continue;
             }
             let raw_path = entry.path().context("invalid tar member path")?;
             let path = raw_path
@@ -1163,9 +1177,10 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
                 if let Some(parent) = out.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                let size = entry.header().size().context("invalid tar member size")?;
-                // The header's size bounds the read; a short body is an
-                // error, never a truncated file.
+                let size = entry.size();
+                // The resolved size (PAX `size` record included) bounds
+                // the read; a short body is an error, never a truncated
+                // file.
                 let mut data = Vec::new();
                 (&mut entry)
                     .take(size)
@@ -1178,14 +1193,16 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
             }
         }
     }
-    // The archive loop ran to EOF (ignore_zeros), so any remaining bytes
-    // indicate a second gzip member that failed to decode; drain anyway
-    // to surface its error explicitly.
+    // The archive loop stops at the end-of-archive marker (the first
+    // zero block). Whatever follows — the second zero block, tar-style
+    // zero padding up to the record size, or further gzip members —
+    // must be all zeros: a concatenated archive or trailing garbage is
+    // refused, so no member can be smuggled past the end marker.
     let mut rest = Vec::new();
     gz.read_to_end(&mut rest)
         .context("malformed data after the archive")?;
-    if !rest.is_empty() {
-        bail!("trailing data after the end of the archive");
+    if rest.iter().any(|&b| b != 0) {
+        bail!("non-zero data after the end of the archive");
     }
     Ok(())
 }
@@ -1764,6 +1781,102 @@ mod tests {
     }
 
     #[test]
+    fn pax_size_record_governs_the_member_length() {
+        // R7-1 regression: a PAX `size` record overrides the ustar
+        // header's (stale) size field; the reader must honor the
+        // resolved entry size, not the raw header size that silently
+        // truncated the member to an empty file.
+        let payload = b"9 size=5
+";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"p", b'x', payload.len()));
+        raw.extend_from_slice(payload);
+        raw.extend_from_slice(&vec![0u8; (512 - payload.len() % 512) % 512]);
+        raw.extend_from_slice(&raw_header(b"f.txt", b'0', 0)); // stale size
+        raw.extend_from_slice(b"HELLO");
+        raw.extend_from_slice(&vec![0u8; 512 - 5]);
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-ps-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        extract_tarball(&gz, &dest, None).unwrap();
+        assert_eq!(fs::read(dest.join("f.txt")).unwrap(), b"HELLO");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn concatenated_tar_after_the_end_marker_is_refused() {
+        // R7-2 regression: valid tar members after the end-of-archive
+        // marker must be refused -- they could overwrite earlier files.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"f.txt", b'0', 1));
+        raw.extend_from_slice(b"A");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        raw.extend_from_slice(&[0u8; 1024]); // end marker
+        raw.extend_from_slice(&raw_header(b"f.txt", b'0', 1));
+        raw.extend_from_slice(b"B");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-cat-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        assert!(extract_tarball(&gz, &dest, None).is_err());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn zero_padding_after_the_end_marker_is_tolerated() {
+        // tar pads past the two end blocks up to its record size; that
+        // zero padding is fine, anything non-zero is not.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"a.txt", b'0', 1));
+        raw.extend_from_slice(b"x");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        raw.extend_from_slice(&[0u8; 1024 + 5120]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-zp-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        extract_tarball(&gz, &dest, None).unwrap();
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"x");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn malformed_pax_records_are_refused() {
+        // R7-3 regression: the crate's own PAX lookups silently drop
+        // malformed records; the reader validates them explicitly.
+        let payload = b"BAD
+";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"p", b'x', payload.len()));
+        raw.extend_from_slice(payload);
+        raw.extend_from_slice(&vec![0u8; (512 - payload.len() % 512) % 512]);
+        raw.extend_from_slice(&tar_file_entry("f.txt", b"x"));
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-mp-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        assert!(extract_tarball(&gz, &dest, None).is_err());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn global_pax_headers_are_validated_and_skipped() {
+        // R7-4: a global PAX header (typeflag 'g') is validated
+        // record-wise and skipped -- not refused, not applied.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"p", b'g', 0));
+        raw.extend_from_slice(&tar_file_entry("f.txt", b"x"));
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-gp-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        extract_tarball(&gz, &dest, None).unwrap();
+        assert_eq!(fs::read(dest.join("f.txt")).unwrap(), b"x");
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn malformed_gzip_and_tar_frames_are_errors() {
         let dest = std::env::temp_dir().join(format!("typship-g-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
@@ -1807,6 +1920,15 @@ mod tests {
     // pending_name_overrides_never_leak_to_the_next_member、
     // single_zero_block_is_not_a_complete_end_marker）随之删除；
     // crate 对「缺结束块」静默接受的严格性让渡也已记录在案。
+
+    #[test]
+    fn json_duplicate_keys_are_last_wins() {
+        // R7-5: serde_json object semantics -- a repeated key's last
+        // value wins (the previous hand-written parser kept the first).
+        // Declared behavior; callers must not rely on first-wins.
+        let value = json_parse(r#"{"version":"1.0.0","version":"2.0.0"}"#, "doc").unwrap();
+        assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("2.0.0"));
+    }
 
     #[test]
     fn http_404_fails_immediately_without_retry() {
@@ -2189,6 +2311,15 @@ mod tests {
         let mut enc = GzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(raw).unwrap();
         enc.finish().unwrap()
+    }
+
+    /// A single plain-file tar entry (header + data + padding), raw.
+    fn tar_file_entry(name: &str, contents: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&raw_header(name.as_bytes(), b'0', contents.len()));
+        out.extend_from_slice(contents);
+        out.extend_from_slice(&vec![0u8; (512 - contents.len() % 512) % 512]);
+        out
     }
 
     /// A valid ustar header with a computed checksum.
