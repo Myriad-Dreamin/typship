@@ -5,12 +5,22 @@
 //! TLS (`ureq` with rustls) and compression (`flate2`). The tar container
 //! itself is encoded and decoded here with the standard library only
 //! (ustar headers, GNU long-name entries and PAX `path` records for
-//! reading, end-of-archive blocks for writing).
+//! reading, end-of-archive blocks for writing), and JSON responses are
+//! read with the small built-in parser in [`json`].
 //!
 //! Safety posture for untrusted archives: member paths are validated (no
-//! absolute paths, no `..`, no backslashes, no drive letters), the header
-//! checksum is verified, resource budgets bound the number of members and
-//! the total unpacked size, and link/device members are rejected outright.
+//! absolute paths, no `..`, no backslashes, no colons, no Windows device
+//! names, no trailing dots or spaces), member names must be UTF-8, the
+//! header checksum is verified, the gzip stream must end cleanly and the
+//! tar must contain an end-of-archive marker, and resource budgets bound
+//! the number of members (including metadata headers) and the total
+//! unpacked size. Link and device members are rejected outright.
+//!
+//! HTTP posture: only transient failures (transport errors, 429 and 5xx)
+//! are retried; other 4xx answers are a definitive miss, over-long
+//! response bodies are refused rather than truncated, and a non-gzip
+//! tarball body is a permanent failure that never triggers another
+//! request.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -19,7 +29,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -30,7 +40,11 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 const RETRIES: usize = 3;
 /// Maximum bytes of one HTTP response body we accept.
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
-/// Maximum number of members accepted from one archive.
+/// Maximum bytes read past the tar end-of-archive marker while checking
+/// that only zero padding follows.
+const MAX_TRAILER: u64 = 64 * 1024 * 1024;
+/// Maximum number of members accepted from one archive; metadata
+/// headers (`x`/`L`/`g`/`K`) count against this budget too.
 const MAX_ARCHIVE_ENTRIES: usize = 50_000;
 /// Maximum total uncompressed bytes accepted from one archive.
 const MAX_TOTAL_UNPACKED: u64 = 1024 * 1024 * 1024;
@@ -48,63 +62,96 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
-/// Read a response body with a hard size cap; an over-long body is an
-/// error, never a silent truncation.
-fn read_body_capped(reader: impl Read, url: &str) -> Result<Vec<u8>> {
-    let mut reader = reader.take(MAX_DOWNLOAD);
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 64 * 1024];
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .with_context(|| format!("reading body of {url}"))?;
-        if n == 0 {
-            return Ok(buf);
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if buf.len() as u64 >= MAX_DOWNLOAD {
-            // The cap was reached and there may be more: refuse, don't
-            // truncate.
-            let mut probe = [0u8; 1];
-            if reader.read(&mut probe).context("reading body of {url}")? > 0 {
-                bail!(
-                    "body of {url} exceeds the {} MiB download limit",
-                    MAX_DOWNLOAD / (1024 * 1024)
-                );
+/// Why a fetch failed, classified so callers know whether to retry, to
+/// fall back to the next candidate, or to stop.
+#[derive(Debug)]
+enum FetchError {
+    /// The resource definitively does not exist (or another permanent
+    /// 4xx client error): retrying or another candidate may help, but
+    /// re-asking the same URL never will.
+    NotFound(String),
+    /// A permanent non-transport problem (e.g. the body is not a gzip
+    /// tarball): no retry and no fallback can fix it.
+    Fatal(String),
+    /// A transport error, a 429 or a 5xx: worth retrying.
+    Transient(String),
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FetchError::NotFound(m) | FetchError::Fatal(m) | FetchError::Transient(m) => {
+                write!(f, "{m}")
             }
-            return Ok(buf);
         }
     }
 }
 
-/// GET a URL to bytes, retrying only transient failures.
-fn get_bytes(url: &str) -> Result<Vec<u8>> {
+impl From<FetchError> for anyhow::Error {
+    fn from(e: FetchError) -> Self {
+        anyhow!("{e}")
+    }
+}
+
+/// Read a response body with a hard size cap. The reader is capped at
+/// `limit + 1` bytes, so an over-long body is detected by its length
+/// alone — no truncation, no second probe read.
+fn read_body_capped(reader: impl Read, limit: u64, url: &str) -> Result<Vec<u8>> {
+    let mut reader = reader.take(limit + 1);
+    let mut buf = Vec::new();
+    reader
+        .read_to_end(&mut buf)
+        .with_context(|| format!("reading body of {url}"))?;
+    if buf.len() as u64 > limit {
+        bail!(
+            "body of {url} exceeds the {} MiB download limit",
+            limit / (1024 * 1024)
+        );
+    }
+    Ok(buf)
+}
+
+/// GET a URL to bytes, retrying only transient failures. A body read
+/// error is treated as transient: the connection may have died mid-body.
+fn get_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
     let mut last = None;
     for attempt in 0..RETRIES {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(500 * attempt as u64));
         }
         match agent().get(url).call() {
-            Ok(resp) => return read_body_capped(resp.into_reader(), url),
+            Ok(resp) => {
+                return read_body_capped(resp.into_reader(), MAX_DOWNLOAD, url)
+                    .map_err(|e| FetchError::Transient(format!("{e:#}")));
+            }
             // Permanent client errors are not worth retrying; 429 and 5xx are.
             Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) && code != 429 => {
-                bail!("GET {url} failed: HTTP {code}");
+                return Err(FetchError::NotFound(format!(
+                    "GET {url} failed: HTTP {code}"
+                )));
             }
-            Err(e) => last = Some(e),
+            Err(e) => {
+                last = Some(FetchError::Transient(format!("GET {url}: {e}")));
+            }
         }
     }
-    Err(anyhow!(
-        "GET {url} failed after {RETRIES} attempts: {}",
-        last.unwrap()
-    ))
+    Err(last.unwrap())
 }
 
-/// GET a URL that must yield a gzipped tarball. A single request; a
-/// non-gzip body is an error, never a reason to re-request.
-fn get_tarball(url: &str) -> Result<Vec<u8>> {
+/// [`get_bytes`] with the error flattened into `anyhow` for callers that
+/// do not branch on the classification.
+fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    get_bytes(url).map_err(anyhow::Error::from)
+}
+
+/// GET a URL that must yield a gzipped tarball. A non-gzip body is a
+/// permanent failure, never a reason to re-request.
+fn get_tarball(url: &str) -> Result<Vec<u8>, FetchError> {
     let bytes = get_bytes(url)?;
     if bytes.len() < 2 || bytes[0] != 0x1f || bytes[1] != 0x8b {
-        bail!("body of {url} is not a gzipped tarball");
+        return Err(FetchError::Fatal(format!(
+            "body of {url} is not a gzipped tarball"
+        )));
     }
     Ok(bytes)
 }
@@ -153,7 +200,8 @@ pub enum Source {
     /// A GitHub release URL (`releases/latest`, `releases/tag/{tag}` or
     /// `releases/{tag}`). Resolved through the GitHub API: a `.tar.gz`/
     /// `.tgz` asset is preferred, the source archive of the resolved tag
-    /// is the fallback.
+    /// is the fallback. `releases/tag/latest` names the literal tag
+    /// `latest`, not the latest release.
     GithubRelease {
         /// `owner/repo`.
         repo: String,
@@ -194,7 +242,10 @@ fn is_fs_path(s: &str) -> bool {
                 .is_some_and(|b| *b == b'/' || *b == b'\\'))
 }
 
-/// Parse `@namespace/name[:version]`.
+/// Parse `@namespace/name[:version]`. Every component must be a single
+/// path-safe, dot-free segment: `.` and `..` are rejected, and colons
+/// are not allowed (they are the version separator and an NTFS stream
+/// marker).
 fn parse_at(s: &str) -> Result<Source> {
     let body = &s[1..];
     let (ns_name, version) = match body.split_once(':') {
@@ -211,7 +262,12 @@ fn parse_at(s: &str) -> Result<Source> {
         if part.is_empty() {
             continue;
         }
-        if part.contains('/') || part.contains('\\') || part == ".." {
+        if part.contains('/')
+            || part.contains('\\')
+            || part.contains(':')
+            || part == "."
+            || part == ".."
+        {
             bail!(
                 "invalid pack spec `{s}`: namespace, name and version must be single path-safe components"
             );
@@ -257,8 +313,10 @@ pub fn parse_source(s: &str) -> Result<Source> {
             let mut it = rest.splitn(2, '/');
             let (owner, repo) = (
                 it.next()
+                    .filter(|p| !p.is_empty())
                     .ok_or_else(|| anyhow!("invalid GitHub URL `{s}`"))?,
                 it.next()
+                    .filter(|p| !p.is_empty())
                     .ok_or_else(|| anyhow!("invalid GitHub URL `{s}`"))?,
             );
             return Ok(Source::Url {
@@ -302,19 +360,13 @@ pub fn parse_source(s: &str) -> Result<Source> {
                     });
                 }
                 Some("tag") => {
-                    let tag = segs
-                        .get(5)
-                        .copied()
-                        .ok_or_else(|| anyhow!("invalid GitHub release URL `{s}`"))?;
-                    if tag == "latest" {
-                        return Ok(Source::GithubRelease {
-                            repo: format!("{owner}/{repo}"),
-                            tag: None,
-                        });
-                    }
+                    // The tag may contain slashes: everything after
+                    // `tag/` is the literal tag, including a tag that
+                    // happens to be named `latest`.
+                    let tag = segs.get(5..).filter(|t| !t.is_empty()).map(|t| t.join("/"));
                     return Ok(Source::GithubRelease {
                         repo: format!("{owner}/{repo}"),
-                        tag: Some(tag.to_string()),
+                        tag,
                     });
                 }
                 Some("latest") => {
@@ -323,10 +375,10 @@ pub fn parse_source(s: &str) -> Result<Source> {
                         tag: None,
                     });
                 }
-                Some(tag) => {
+                Some(_tag) => {
                     return Ok(Source::GithubRelease {
                         repo: format!("{owner}/{repo}"),
-                        tag: Some(tag.to_string()),
+                        tag: Some(segs[4..].join("/")),
                     });
                 }
                 None => bail!("invalid GitHub release URL `{s}`"),
@@ -376,15 +428,16 @@ pub fn parse_dest(s: &str) -> Result<Dest> {
         if segs.len() >= 5 && segs[0] == "github.com" && segs[3] == "releases" {
             let tag = match segs[4] {
                 "tag" => segs
-                    .get(5)
-                    .copied()
+                    .get(5..)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| t.join("/"))
                     .ok_or_else(|| anyhow!("invalid GitHub release URL `{s}`"))?,
                 "download" => bail!("`{s}` is an asset URL, not an upload target"),
-                other => other,
+                _ => segs[4..].join("/"),
             };
             return Ok(Dest::Release {
                 repo: format!("{}/{}", segs[1], segs[2]),
-                tag: tag.to_string(),
+                tag,
             });
         }
     }
@@ -409,11 +462,13 @@ fn normalize_absolute(p: &Path) -> PathBuf {
         .collect()
 }
 
-/// Strip `\\?\` / `\\?\UNC\` verbatim prefixes (Windows only).
+/// Strip `\\?\` / `\\?\UNC\` verbatim prefixes (Windows only). The UNC
+/// form keeps two leading backslashes: `\\?\UNC\server\share` is
+/// `\\server\share`.
 #[cfg(target_os = "windows")]
 fn strip_verbatim(text: String) -> String {
     if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!("\\{rest}")
+        format!(r"\\{rest}")
     } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
         rest.to_string()
     } else {
@@ -427,41 +482,110 @@ fn strip_verbatim(text: String) -> String {
     text
 }
 
+/// Collapse `.` and `..` components lexically; a leading `..` at the
+/// filesystem root is kept (it cannot go higher).
+fn fold_dots(p: &Path) -> PathBuf {
+    let mut comps: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let popped = matches!(
+                    comps.last(),
+                    Some(Component::Normal(_)) | Some(Component::ParentDir)
+                );
+                if popped {
+                    comps.pop();
+                } else {
+                    comps.push(c);
+                }
+            }
+            other => comps.push(other),
+        }
+    }
+    comps.into_iter().collect()
+}
+
+/// The physical path of `p` as far as the filesystem can tell: the
+/// longest existing ancestor is canonicalized (resolving symlinks,
+/// junctions and case differences) and the remaining suffix joined back
+/// on. Non-existing tails keep their lexical form.
+fn physical(p: &Path) -> PathBuf {
+    let norm = normalize_absolute(p);
+    let mut ancestor = norm.as_path();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match ancestor.canonicalize() {
+            Ok(real) => {
+                let mut out: PathBuf = real;
+                for part in suffix.iter().rev() {
+                    out.push(part);
+                }
+                return normalize_absolute(&out);
+            }
+            Err(_) => match (ancestor.parent(), ancestor.file_name()) {
+                (Some(parent), Some(last)) => {
+                    suffix.push(last.to_os_string());
+                    ancestor = parent;
+                }
+                _ => return normalize_absolute(p),
+            },
+        }
+    }
+}
+
+/// Component-wise path comparison; on Windows the comparison is
+/// case-insensitive because NTFS names are case-preserving but
+/// case-insensitive.
+fn path_comps(p: &Path) -> Vec<String> {
+    p.components()
+        .map(|c| {
+            let s = c.as_os_str().to_string_lossy().to_string();
+            #[cfg(target_os = "windows")]
+            let s = s.to_ascii_lowercase();
+            s
+        })
+        .collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    path_comps(a) == path_comps(b)
+}
+
+/// Whether `child` equals `parent` or sits below it, component-wise.
+fn is_prefix(child: &Path, parent: &Path) -> bool {
+    let c = path_comps(child);
+    let p = path_comps(parent);
+    p.len() <= c.len() && c[..p.len()] == p[..]
+}
+
 /// Refuse a copy whose destination is the source or sits inside it (or
-/// vice versa); otherwise `copy_tree` recurses into itself. Best-effort
-/// alias resolution through canonicalize is included for the side of the
-/// pair that already exists.
+/// vice versa); otherwise `copy_tree` recurses into itself. Both ends
+/// are resolved physically (existing ancestors canonicalized, so
+/// junctions, symlinks and case aliases cannot slip past) and compared
+/// component-wise.
 fn ensure_distinct(src: &Path, dst: &Path) -> Result<()> {
-    let s = normalize_absolute(src);
-    let d = normalize_absolute(dst);
-    if s == d {
+    let s = fold_dots(&physical(src));
+    let d = fold_dots(&physical(dst));
+    if same_path(&s, &d) {
         bail!(
             "source and destination are the same directory `{}`",
             src.display()
         );
     }
-    if d.starts_with(&s) {
+    if is_prefix(&d, &s) {
         bail!(
             "destination `{}` is inside source `{}`",
             dst.display(),
             src.display()
         );
     }
-    if s.starts_with(&d) {
+    if is_prefix(&s, &d) {
         bail!(
             "source `{}` is inside destination `{}`",
             src.display(),
             dst.display()
         );
-    }
-    // Alias check when both ends resolve on disk.
-    if let (Ok(sc), Ok(dc)) = (src.canonicalize(), dst.canonicalize()) {
-        if sc == dc {
-            bail!(
-                "source and destination are the same directory `{}`",
-                src.display()
-            );
-        }
     }
     Ok(())
 }
@@ -527,6 +651,18 @@ enum Materialized {
     Tarball(Vec<u8>),
 }
 
+/// Locate a subpath inside an extracted archive. The common case is the
+/// GitHub layout `repo-ref/{subpath}` under the single wrapper
+/// directory, so the direct path below the archive root is tried first;
+/// a recursive search is the fallback for archives that nest deeper.
+fn locate_subdir(tmp: &Path, sub: &str) -> Option<PathBuf> {
+    let direct = archive_root(tmp).join(sub);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+    find_dir(tmp, sub).or_else(|| find_dir(&archive_root(tmp), sub))
+}
+
 /// Resolve a [`Source`] into bytes or a directory.
 fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
     match src {
@@ -540,9 +676,12 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
         Source::Stdin => {
             let mut buf = Vec::new();
             std::io::stdin()
-                .take(MAX_DOWNLOAD)
+                .take(MAX_DOWNLOAD + 1)
                 .read_to_end(&mut buf)
                 .context("reading tarball from stdin")?;
+            if buf.len() as u64 > MAX_DOWNLOAD {
+                bail!("stdin tarball exceeds the download limit");
+            }
             Ok(Materialized::Tarball(buf))
         }
         Source::Registry {
@@ -558,13 +697,9 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
             // Extract to a temp dir, then keep the subpath directory.
             let tmp = temp_dir()?;
             extract_tarball(&bytes, &tmp, None)?;
-            let found =
-                find_dir(&tmp, subpath.as_deref().unwrap_or_default()).ok_or_else(|| {
-                    anyhow!(
-                        "subpath `{}` not found in archive",
-                        subpath.as_deref().unwrap_or_default()
-                    )
-                })?;
+            let sub = subpath.as_deref().unwrap_or_default();
+            let found = locate_subdir(&tmp, sub)
+                .ok_or_else(|| anyhow!("subpath `{sub}` not found in archive"))?;
             Ok(Materialized::Dir(found))
         }
         Source::GithubTree { owner, repo, rest } => materialize_github_tree(owner, repo, rest),
@@ -573,9 +708,9 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
 }
 
 /// Resolve a GitHub tree URL: the ref may contain slashes, so try
-/// interpretations from the longest ref to the shortest one; the first
-/// interpretation that yields a gzip archive wins (the requested subpath
-/// is then located inside it).
+/// interpretations from the longest ref to the shortest one. Only a
+/// definitive miss ([`FetchError::NotFound`]) moves on to the next
+/// candidate; a broken payload or a transport failure aborts.
 fn materialize_github_tree(owner: &str, repo: &str, rest: &[String]) -> Result<Materialized> {
     if rest.is_empty() {
         bail!("invalid GitHub tree URL: no ref after `tree/`");
@@ -595,20 +730,15 @@ fn materialize_github_tree(owner: &str, repo: &str, rest: &[String]) -> Result<M
                     return Ok(Materialized::Tarball(bytes));
                 }
                 let tmp = temp_dir()?;
-                if let Err(e) = extract_tarball(&bytes, &tmp, None) {
-                    last_err = Some(e);
-                    continue;
-                }
-                return match find_dir(&tmp, subpath.as_deref().unwrap_or_default()) {
+                extract_tarball(&bytes, &tmp, None)?;
+                let sub = subpath.as_deref().unwrap_or_default();
+                return match locate_subdir(&tmp, sub) {
                     Some(dir) => Ok(Materialized::Dir(dir)),
-                    None => Err(anyhow!(
-                        "subpath `{}` not found in archive of `{}`",
-                        subpath.unwrap_or_default(),
-                        url
-                    )),
+                    None => Err(anyhow!("subpath `{sub}` not found in archive of `{url}`")),
                 };
             }
-            Err(e) => last_err = Some(e),
+            Err(FetchError::NotFound(e)) => last_err = Some(anyhow!("{e}")),
+            Err(e) => return Err(anyhow!("{e}")),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("could not resolve GitHub tree URL")))
@@ -618,28 +748,37 @@ fn materialize_github_tree(owner: &str, repo: &str, rest: &[String]) -> Result<M
 /// asset, fall back to the source archive of the resolved tag.
 fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materialized> {
     let api = match tag {
-        Some(t) => format!("https://api.github.com/repos/{repo}/releases/tags/{t}"),
+        Some(t) => format!(
+            "https://api.github.com/repos/{repo}/releases/tags/{}",
+            percent_encode(t)
+        ),
         None => format!("https://api.github.com/repos/{repo}/releases/latest"),
     };
-    let body = get_bytes(&api)?;
-    let text = String::from_utf8_lossy(&body);
-    let mut from = 0;
-    while let Some(rel) = text[from..].find("\"browser_download_url\"") {
-        let abs = from + rel;
-        if let Some(url) = json_object_string_field(&text[abs..], "browser_download_url") {
-            let lower = url.to_ascii_lowercase();
-            if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-                return Ok(Materialized::Tarball(get_tarball(&url)?));
-            }
-        }
-        from = abs + "\"browser_download_url\"".len();
+    let body = fetch_bytes(&api)?;
+    let text =
+        String::from_utf8(body).map_err(|_| anyhow!("release response from {api} is not UTF-8"))?;
+    let value = json::parse(&text).map_err(|e| anyhow!("invalid JSON from {api}: {e}"))?;
+    if let Some(url) = release_archive_asset(&value) {
+        return Ok(Materialized::Tarball(get_tarball(&url)?));
     }
     // No archive asset: fall back to the source archive of the tag.
-    let tag_name = json_object_string_field(&text, "tag_name")
+    let tag_name = value
+        .get("tag_name")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("release lookup for `{repo}` returned no tag_name"))?;
     Ok(Materialized::Tarball(get_tarball(&format!(
         "https://codeload.github.com/{repo}/tar.gz/refs/tags/{tag_name}"
     ))?))
+}
+
+/// The first `.tar.gz`/`.tgz` asset download URL of a parsed release
+/// document, if any.
+fn release_archive_asset(release: &json::Value) -> Option<String> {
+    release.get("assets")?.as_arr()?.iter().find_map(|asset| {
+        let url = asset.get("browser_download_url")?.as_str()?;
+        let lower = url.to_ascii_lowercase();
+        (lower.ends_with(".tar.gz") || lower.ends_with(".tgz")).then(|| url.to_string())
+    })
 }
 
 /// Resolve a registry pack to a tarball download or a local directory.
@@ -676,39 +815,48 @@ fn materialize_registry(
                 "{OFFICIAL_REGISTRY}/{name}-{version}.tar.gz"
             ))?))
         }
-        Some(url) if url.contains("github.com") => {
+        Some(url) => {
             // A GitHub repository acting as a packages registry, using the
             // standard Typst layout `packages/{namespace}/{name}/{version}`
             // (a legacy flat `packages/{name}` layout is also accepted).
-            let rest = url
-                .trim_start_matches("https://")
-                .trim_start_matches("http://")
-                .strip_prefix("github.com/")
-                .ok_or_else(|| anyhow!("invalid GitHub registry `{url}`"))?;
-            let mut it = rest.splitn(2, '/');
-            let (owner, repo) = (
-                it.next()
-                    .ok_or_else(|| anyhow!("invalid GitHub registry `{url}`"))?,
-                it.next().unwrap_or_default().trim_end_matches('/'),
-            );
-            let bytes = get_tarball(&format!(
-                "https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD"
-            ))?;
-            let tmp = temp_dir()?;
-            extract_tarball(&bytes, &tmp, None)?;
-            let pkg_base = find_dir(&tmp, &format!("packages/{namespace}/{name}"))
-                .or_else(|| find_dir(&tmp, &format!("packages/{name}")))
-                .ok_or_else(|| {
-                    anyhow!("package `{namespace}/{name}` not found in registry `{url}`")
-                })?;
-            let version = match version {
-                Some(v) => v.to_string(),
-                None => latest_version_dir(&pkg_base)?
-                    .ok_or_else(|| anyhow!("no version of `{name}` in registry `{url}`"))?,
-            };
-            Ok(Materialized::Dir(pkg_base.join(version)))
-        }
-        Some(url) => {
+            // Only the exact host github.com counts.
+            let github: Option<String> = url
+                .strip_prefix("https://github.com/")
+                .or_else(|| url.strip_prefix("http://github.com/"))
+                .map(|p| p.trim_matches('/').to_string());
+            if let Some(path) = github {
+                let mut it = path.splitn(2, '/');
+                let owner = it
+                    .next()
+                    .filter(|p| !p.is_empty())
+                    .ok_or_else(|| anyhow!("invalid GitHub registry `{url}`"))?;
+                let repo = it
+                    .next()
+                    .unwrap_or_default()
+                    .split('/')
+                    .next()
+                    .unwrap_or_default();
+                if repo.is_empty() {
+                    bail!("invalid GitHub registry `{url}`");
+                }
+                let bytes = get_tarball(&format!(
+                    "https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD"
+                ))?;
+                let tmp = temp_dir()?;
+                extract_tarball(&bytes, &tmp, None)?;
+                let root = archive_root(&tmp);
+                let pkg_base = find_dir(&root, &format!("packages/{namespace}/{name}"))
+                    .or_else(|| find_dir(&root, &format!("packages/{name}")))
+                    .ok_or_else(|| {
+                        anyhow!("package `{namespace}/{name}` not found in registry `{url}`")
+                    })?;
+                let version = match version {
+                    Some(v) => v.to_string(),
+                    None => latest_version_dir(&pkg_base)?
+                        .ok_or_else(|| anyhow!("no version of `{name}` in registry `{url}`"))?,
+                };
+                return Ok(Materialized::Dir(pkg_base.join(version)));
+            }
             let version = match version {
                 Some(v) => v.to_string(),
                 None => latest_index_version(url, name)?,
@@ -727,29 +875,41 @@ fn latest_official_version(name: &str) -> Result<String> {
     latest_index_version(OFFICIAL_REGISTRY, name)
 }
 
-/// Latest version of a package from `{base}/index.json`. The scan is
-/// tolerant of whitespace and of field order: the body is split into
-/// object chunks and each chunk is searched for `name` and `version`.
+/// Latest version of a package from `{base}/index.json`: fetch the
+/// index and hand the text to [`latest_from_index_json`].
 fn latest_index_version(base: &str, name: &str) -> Result<String> {
-    let body = get_bytes(&format!("{}/index.json", base.trim_end_matches('/')))?;
-    let text = String::from_utf8_lossy(&body);
+    let body = fetch_bytes(&format!("{}/index.json", base.trim_end_matches('/')))?;
+    let text = String::from_utf8(body)
+        .map_err(|_| anyhow!("registry index at {base}/index.json is not UTF-8"))?;
+    latest_from_index_json(&text, name)
+        .map_err(|e| anyhow!("reading registry index at {base}/index.json: {e:#}"))
+}
+
+/// The greatest version among the entries of a registry index whose
+/// `name` matches, parsed as real JSON (the index is an array of
+/// objects). Pure so tests exercise the production function directly.
+fn latest_from_index_json(text: &str, name: &str) -> Result<String> {
+    let value = json::parse(text).map_err(|e| anyhow!("invalid JSON: {e}"))?;
+    let entries = value
+        .as_arr()
+        .ok_or_else(|| anyhow!("registry index JSON is not an array"))?;
     let mut best: Option<(Vec<u64>, String)> = None;
-    for chunk in text.split('}') {
-        if json_object_string_field(chunk, "name").as_deref() != Some(name) {
+    for entry in entries {
+        if entry.get("name").and_then(|v| v.as_str()) != Some(name) {
             continue;
         }
-        if let Some(v) = json_object_string_field(chunk, "version") {
+        if let Some(v) = entry.get("version").and_then(|v| v.as_str()) {
             let nums: Vec<u64> = v
                 .split('.')
                 .map(|p| p.parse::<u64>().unwrap_or(0))
                 .collect();
             if best.as_ref().is_none_or(|(b, _)| nums > *b) {
-                best = Some((nums, v));
+                best = Some((nums, v.to_string()));
             }
         }
     }
     best.map(|(_, v)| v)
-        .ok_or_else(|| anyhow!("package `{name}` not found in registry index at {base}/index.json"))
+        .ok_or_else(|| anyhow!("package `{name}` not found in registry index"))
 }
 
 /// Find a directory named `rel` anywhere below `root`.
@@ -793,6 +953,303 @@ fn temp_dir() -> Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// JSON — a minimal reader, standard library only.
+// ---------------------------------------------------------------------------
+
+mod json {
+    //! A minimal JSON reader covering objects, arrays, strings (with
+    //! `\uXXXX` escapes and surrogate pairs), numbers and the three
+    //! literals. Just enough to read GitHub API and registry index
+    //! documents correctly; never a text scan.
+
+    /// A parsed JSON value.
+    #[allow(dead_code)] // Bool/Num exist for completeness of the reader
+    #[derive(Debug, Clone)]
+    pub enum Value {
+        Null,
+        Bool(bool),
+        Num(f64),
+        Str(String),
+        Arr(Vec<Value>),
+        Obj(Vec<(String, Value)>),
+    }
+
+    impl Value {
+        /// The value of `key` in this object, if this is an object.
+        pub fn get(&self, key: &str) -> Option<&Value> {
+            match self {
+                Value::Obj(items) => items.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+                _ => None,
+            }
+        }
+
+        /// The string content, if this is a string.
+        pub fn as_str(&self) -> Option<&str> {
+            match self {
+                Value::Str(s) => Some(s),
+                _ => None,
+            }
+        }
+
+        /// The element slice, if this is an array.
+        pub fn as_arr(&self) -> Option<&[Value]> {
+            match self {
+                Value::Arr(a) => Some(a),
+                _ => None,
+            }
+        }
+
+        /// The string value of `key` anywhere below this value,
+        /// recursing through objects and arrays.
+        #[allow(dead_code)]
+        pub fn find_str(&self, key: &str) -> Option<&str> {
+            match self {
+                Value::Obj(items) => {
+                    for (k, v) in items {
+                        if k == key {
+                            if let Some(s) = v.as_str() {
+                                return Some(s);
+                            }
+                        }
+                        if let Some(s) = v.find_str(key) {
+                            return Some(s);
+                        }
+                    }
+                    None
+                }
+                Value::Arr(items) => items.iter().find_map(|v| v.find_str(key)),
+                _ => None,
+            }
+        }
+    }
+
+    /// Parse a complete JSON document.
+    pub fn parse(text: &str) -> Result<Value, String> {
+        let mut p = Parser {
+            b: text.as_bytes(),
+            i: 0,
+            depth: 0,
+        };
+        p.ws();
+        let v = p.value()?;
+        p.ws();
+        if p.i != p.b.len() {
+            return Err("trailing characters after the JSON value".to_string());
+        }
+        Ok(v)
+    }
+
+    struct Parser<'a> {
+        b: &'a [u8],
+        i: usize,
+        depth: usize,
+    }
+
+    impl<'a> Parser<'a> {
+        fn ws(&mut self) {
+            while matches!(self.b.get(self.i), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.i += 1;
+            }
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.b.get(self.i).copied()
+        }
+
+        fn starts_with(&self, s: &[u8]) -> bool {
+            self.b[self.i..].starts_with(s)
+        }
+
+        fn value(&mut self) -> Result<Value, String> {
+            self.depth += 1;
+            if self.depth > 64 {
+                return Err("JSON nesting deeper than 64 levels".to_string());
+            }
+            let v = match self.peek() {
+                Some(b'{') => self.object(),
+                Some(b'[') => self.array(),
+                Some(b'"') => self.string().map(Value::Str),
+                Some(b't') if self.starts_with(b"true") => {
+                    self.i += 4;
+                    Ok(Value::Bool(true))
+                }
+                Some(b'f') if self.starts_with(b"false") => {
+                    self.i += 5;
+                    Ok(Value::Bool(false))
+                }
+                Some(b'n') if self.starts_with(b"null") => {
+                    self.i += 4;
+                    Ok(Value::Null)
+                }
+                Some(c) if c == b'-' || c.is_ascii_digit() => self.number(),
+                _ => Err(format!("unexpected byte at offset {}", self.i)),
+            };
+            self.depth -= 1;
+            v
+        }
+
+        fn object(&mut self) -> Result<Value, String> {
+            self.i += 1; // '{'
+            let mut items = Vec::new();
+            self.ws();
+            if self.peek() == Some(b'}') {
+                self.i += 1;
+                return Ok(Value::Obj(items));
+            }
+            loop {
+                self.ws();
+                if self.peek() != Some(b'"') {
+                    return Err(format!("expected object key at offset {}", self.i));
+                }
+                let key = self.string()?;
+                self.ws();
+                if self.peek() != Some(b':') {
+                    return Err(format!("expected ':' at offset {}", self.i));
+                }
+                self.i += 1;
+                self.ws();
+                let val = self.value()?;
+                items.push((key, val));
+                self.ws();
+                match self.peek() {
+                    Some(b',') => self.i += 1,
+                    Some(b'}') => {
+                        self.i += 1;
+                        return Ok(Value::Obj(items));
+                    }
+                    _ => return Err(format!("expected ',' or '}}' at offset {}", self.i)),
+                }
+            }
+        }
+
+        fn array(&mut self) -> Result<Value, String> {
+            self.i += 1; // '['
+            let mut items = Vec::new();
+            self.ws();
+            if self.peek() == Some(b']') {
+                self.i += 1;
+                return Ok(Value::Arr(items));
+            }
+            loop {
+                self.ws();
+                items.push(self.value()?);
+                self.ws();
+                match self.peek() {
+                    Some(b',') => self.i += 1,
+                    Some(b']') => {
+                        self.i += 1;
+                        return Ok(Value::Arr(items));
+                    }
+                    _ => return Err(format!("expected ',' or ']' at offset {}", self.i)),
+                }
+            }
+        }
+
+        fn string(&mut self) -> Result<String, String> {
+            self.i += 1; // '"'
+            let mut out: Vec<u8> = Vec::new();
+            loop {
+                let c = *self
+                    .b
+                    .get(self.i)
+                    .ok_or_else(|| "unterminated string".to_string())?;
+                self.i += 1;
+                match c {
+                    b'"' => return String::from_utf8(out).map_err(|_| "bad UTF-8".to_string()),
+                    b'\\' => {
+                        let esc = *self
+                            .b
+                            .get(self.i)
+                            .ok_or_else(|| "truncated escape".to_string())?;
+                        self.i += 1;
+                        match esc {
+                            b'"' => out.push(b'"'),
+                            b'\\' => out.push(b'\\'),
+                            b'/' => out.push(b'/'),
+                            b'b' => out.push(0x08),
+                            b'f' => out.push(0x0c),
+                            b'n' => out.push(b'\n'),
+                            b'r' => out.push(b'\r'),
+                            b't' => out.push(b'\t'),
+                            b'u' => {
+                                let mut code = self.hex4()?;
+                                if (0xD800..0xDC00).contains(&code) {
+                                    // High surrogate: a low surrogate must follow.
+                                    if self.peek() == Some(b'\\')
+                                        && self.b.get(self.i + 1) == Some(&b'u')
+                                    {
+                                        self.i += 2;
+                                        let low = self.hex4()?;
+                                        if !(0xDC00..0xE000).contains(&low) {
+                                            return Err("invalid low surrogate".to_string());
+                                        }
+                                        code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                                    } else {
+                                        return Err("unpaired surrogate".to_string());
+                                    }
+                                } else if (0xDC00..0xE000).contains(&code) {
+                                    return Err("unpaired surrogate".to_string());
+                                }
+                                let ch = char::from_u32(code)
+                                    .ok_or_else(|| "invalid codepoint".to_string())?;
+                                let mut buf = [0u8; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                            }
+                            _ => return Err("unknown escape".to_string()),
+                        }
+                    }
+                    c if c < 0x20 => {
+                        return Err("raw control character in string".to_string());
+                    }
+                    c => out.push(c),
+                }
+            }
+        }
+
+        fn hex4(&mut self) -> Result<u32, String> {
+            if self.i + 4 > self.b.len() {
+                return Err("truncated \\u escape".to_string());
+            }
+            let s = std::str::from_utf8(&self.b[self.i..self.i + 4])
+                .map_err(|_| "bad \\u escape".to_string())?;
+            let v = u32::from_str_radix(s, 16).map_err(|_| "bad \\u escape".to_string())?;
+            self.i += 4;
+            Ok(v)
+        }
+
+        fn number(&mut self) -> Result<Value, String> {
+            let start = self.i;
+            if self.peek() == Some(b'-') {
+                self.i += 1;
+            }
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.i += 1;
+            }
+            if self.peek() == Some(b'.') {
+                self.i += 1;
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.i += 1;
+                }
+            }
+            if matches!(self.peek(), Some(b'e' | b'E')) {
+                self.i += 1;
+                if matches!(self.peek(), Some(b'+' | b'-')) {
+                    self.i += 1;
+                }
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.i += 1;
+                }
+            }
+            let text = std::str::from_utf8(&self.b[start..self.i])
+                .map_err(|_| "bad number".to_string())?;
+            text.parse::<f64>()
+                .map(Value::Num)
+                .map_err(|_| format!("bad number `{text}`"))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tar (ustar) codec — standard library only.
 // ---------------------------------------------------------------------------
 
@@ -812,13 +1269,14 @@ fn octal(field: &[u8]) -> Result<u64> {
     u64::from_str_radix(s, 8).context("invalid octal field in tar header")
 }
 
-/// Decode archive path bytes: UTF-8 when valid, latin-1 as the fallback
-/// so every byte survives the round trip.
-fn decode_path(bytes: &[u8]) -> String {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => s.to_string(),
-        Err(_) => bytes.iter().map(|&b| b as char).collect(),
-    }
+/// Decode archive path bytes: they must be UTF-8. Non-UTF-8 member names
+/// are rejected with a clear error rather than round-tripped through a
+/// lossy encoding.
+fn decode_path(bytes: &[u8]) -> Result<String> {
+    let s = std::str::from_utf8(bytes).map_err(|_| {
+        anyhow!("archive member name is not valid UTF-8; such archives are rejected")
+    })?;
+    Ok(s.trim_end_matches('\0').to_string())
 }
 
 fn nul_terminated(bytes: &[u8]) -> &[u8] {
@@ -839,27 +1297,48 @@ struct TarEntry {
 }
 
 /// Read the `path` record out of a PAX extended header, if present.
-fn pax_path(data: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(data);
-    for line in text.split('\n') {
-        let line = line.trim_end_matches('\r');
-        if let Some(eq) = line.find(" path=") {
-            let digits = &line[..eq];
-            if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                return Some(line[eq + " path=".len()..].to_string());
-            }
+/// Records are parsed by their declared length (`<len> key=value\n`), as
+/// the format requires, not by scanning for separators.
+fn pax_path(data: &[u8]) -> Result<Option<String>> {
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(sp) = data[pos..].iter().position(|&b| b == b' ') else {
+            bail!("malformed PAX record: no length separator");
+        };
+        let len_str = std::str::from_utf8(&data[pos..pos + sp])
+            .map_err(|_| anyhow!("malformed PAX record: length is not ASCII"))?;
+        let len: usize = len_str
+            .parse()
+            .map_err(|_| anyhow!("malformed PAX record: bad length `{len_str}`"))?;
+        if len == 0 || pos + len > data.len() {
+            bail!("malformed PAX record: length {len} out of bounds");
+        }
+        let record = &data[pos..pos + len];
+        let prefix_len = sp - pos + 1; // "<len> "
+        pos += len;
+        // The record body after the `<len> ` prefix is `key=value\n`.
+        let body = &record[prefix_len..];
+        let body = body.strip_suffix(b"\n").unwrap_or(body);
+        let Some(eq) = body.iter().position(|&b| b == b'=') else {
+            bail!("malformed PAX record: no '=' separator");
+        };
+        if &body[..eq] == b"path" {
+            return decode_path(&body[eq + 1..]).map(Some);
         }
     }
-    None
+    Ok(None)
 }
 
-/// Decode a gzipped tarball into entries. Untrusted input: the header
-/// checksum is verified, short reads are errors, resource budgets are
-/// enforced, and non-regular members are rejected.
+/// Decode a gzipped tarball into entries. Untrusted input: the gzip
+/// stream must decode cleanly (including trailing garbage, which is an
+/// error), the header checksum is verified, short reads are errors, an
+/// end-of-archive marker is required, resource budgets (including
+/// metadata headers) are enforced, and non-regular members are rejected.
 fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
-    let mut reader = GzDecoder::new(gz);
+    let mut reader = MultiGzDecoder::new(gz);
     let mut entries = Vec::new();
     let mut total: u64 = 0;
+    let mut members_seen: usize = 0;
     let mut pending_long_name: Option<String> = None;
     let mut pending_pax_path: Option<String> = None;
     loop {
@@ -875,19 +1354,27 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
             read += n;
         }
         if read == 0 {
-            // Clean end of stream.
-            break;
+            // The stream ended without an end-of-archive marker.
+            bail!("archive ends without end-of-archive marker");
         }
         if read < 512 {
             bail!("truncated tar header");
         }
+        members_seen += 1;
+        if members_seen > MAX_ARCHIVE_ENTRIES {
+            bail!("archive has too many entries (limit {MAX_ARCHIVE_ENTRIES})");
+        }
         if header.iter().all(|&b| b == 0) {
             // End-of-archive marker: what follows must be zero padding
-            // only, and the gzip stream must be intact.
+            // only, within a bounded read.
             let mut rest = Vec::new();
-            reader
+            (&mut reader)
+                .take(MAX_TRAILER + 1)
                 .read_to_end(&mut rest)
                 .context("reading tar trailer")?;
+            if rest.len() as u64 > MAX_TRAILER {
+                bail!("excessive data after end-of-archive marker");
+            }
             if rest.iter().any(|&b| b != 0) {
                 bail!("garbage after end-of-archive marker");
             }
@@ -919,8 +1406,8 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
             );
         }
         let mut name = {
-            let n = decode_path(nul_terminated(&header[..100]));
-            let prefix = decode_path(nul_terminated(&header[345..500]));
+            let n = decode_path(nul_terminated(&header[..100]))?;
+            let prefix = decode_path(nul_terminated(&header[345..500]))?;
             if prefix.is_empty() {
                 n
             } else {
@@ -941,14 +1428,29 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
         let typeflag = header[156];
         match typeflag {
             b'L' => {
-                pending_long_name = Some(decode_path(nul_terminated(&data)));
+                total += size;
+                pending_long_name = Some(decode_path(nul_terminated(&data))?);
                 continue;
             }
             b'x' => {
-                pending_pax_path = pax_path(&data);
+                total += size;
+                pending_pax_path = pax_path(&data)?;
                 continue;
             }
-            b'g' | b'K' => continue,
+            b'g' => {
+                // A global PAX header replaces any pending extended
+                // attributes rather than extending them.
+                total += size;
+                pending_pax_path = None;
+                pending_long_name = None;
+                continue;
+            }
+            b'K' => {
+                // GNU long-link-name header: the member it names will be
+                // rejected as a link anyway.
+                total += size;
+                continue;
+            }
             b'1' | b'2' => {
                 bail!("tar member `{name}` is a hard/symlink; link members are not supported")
             }
@@ -961,26 +1463,18 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
                 } else if let Some(px) = pending_pax_path.take() {
                     name = px;
                 }
-                if entries.len() >= MAX_ARCHIVE_ENTRIES {
-                    bail!("archive has too many entries (limit {MAX_ARCHIVE_ENTRIES})");
-                }
-                total += size;
                 entries.push(TarEntry {
                     path: name,
                     is_dir: true,
                     data: Vec::new(),
                 });
             }
-            b'0' | b'\0' | b'7' => {
+            b'0' | b'\x00' | b'7' => {
                 if let Some(ln) = pending_long_name.take() {
                     name = ln;
                 } else if let Some(px) = pending_pax_path.take() {
                     name = px;
                 }
-                if entries.len() >= MAX_ARCHIVE_ENTRIES {
-                    bail!("archive has too many entries (limit {MAX_ARCHIVE_ENTRIES})");
-                }
-                total += size;
                 entries.push(TarEntry {
                     path: name,
                     is_dir: false,
@@ -993,8 +1487,18 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
     Ok(entries)
 }
 
+/// Windows reserved device names; a component whose stem (before the
+/// first dot) matches one of these, in any case, cannot exist as a file
+/// or directory on Windows.
+const WINDOWS_RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 /// Validate an archive member path: it must be relative, slash-separated
-/// and stay inside the destination.
+/// UTF-8 text that stays inside the destination and can exist on every
+/// supported filesystem — no drive letters or NTFS streams (colons), no
+/// reserved device names, no trailing dots or spaces.
 fn safe_member_path(path: &str) -> Result<String> {
     if path.is_empty() {
         bail!("empty archive member path");
@@ -1005,13 +1509,24 @@ fn safe_member_path(path: &str) -> Result<String> {
     if path.contains('\\') {
         bail!("backslash in archive path `{path}`");
     }
-    let bytes = path.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' {
-        bail!("windows drive letter in archive path `{path}`");
+    if path.contains(':') {
+        bail!("colon in archive path `{path}`");
     }
     for comp in path.split('/') {
         if comp == ".." {
             bail!("parent directory component in archive path `{path}`");
+        }
+        if comp.is_empty() {
+            bail!("empty component in archive path `{path}`");
+        }
+        if comp.ends_with('.') || comp.ends_with(' ') {
+            bail!(
+                "component `{comp}` in archive path `{path}` ends with a dot or space, which Windows cannot address"
+            );
+        }
+        let stem = comp.split('.').next().unwrap_or_default();
+        if WINDOWS_RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
+            bail!("component `{comp}` in archive path `{path}` is a reserved Windows device name");
         }
     }
     Ok(path.to_string())
@@ -1136,27 +1651,10 @@ impl TarWriter {
                 header[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
             }
         }
-        let mode = if is_dir { b"0000755\0" } else { b"0000644\0" };
-        header[100..108].copy_from_slice(mode);
-        header[108..116].copy_from_slice(b"0000000\0"); // uid
-        header[116..124].copy_from_slice(b"0000000\0"); // gid
-        let size_field = format!("{:011o}\0", if is_dir { 0 } else { data.len() });
-        header[124..136].copy_from_slice(size_field.as_bytes());
-        header[136..148].copy_from_slice(b"00000000000\0"); // mtime
-        header[148..156].copy_from_slice(b"        "); // checksum placeholder
-        header[156] = if is_dir { b'5' } else { b'0' };
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\0 ");
-        header[148..156].copy_from_slice(cs.as_bytes());
-        self.out.write_all(&header)?;
+        self.finish_header(&mut header, if is_dir { b'5' } else { b'0' }, data.len())?;
         if !is_dir {
             self.out.write_all(data)?;
-            let pad = ((512 - (data.len() as u64 % 512)) % 512) as usize;
-            if pad > 0 {
-                self.out.write_all(&vec![0u8; pad])?;
-            }
+            self.write_padding(data.len())?;
         }
         Ok(())
     }
@@ -1167,21 +1665,41 @@ impl TarWriter {
         data.push(0);
         let mut header = [0u8; 512];
         header[..2].copy_from_slice(b"./");
-        let size_field = format!("{:011o}\0", data.len());
-        header[124..136].copy_from_slice(size_field.as_bytes());
-        header[148..156].copy_from_slice(b"        "); // checksum placeholder
-        header[156] = b'L';
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\0 ");
-        header[148..156].copy_from_slice(cs.as_bytes());
-        self.out.write_all(&header)?;
+        self.finish_header(&mut header, b'L', data.len())?;
         self.out.write_all(&data)?;
-        let pad = ((512 - (data.len() as u64 % 512)) % 512) as usize;
+        self.write_padding(data.len())?;
+        Ok(())
+    }
+
+    fn write_padding(&mut self, len: usize) -> Result<()> {
+        let pad = ((512 - (len as u64 % 512)) % 512) as usize;
         if pad > 0 {
             self.out.write_all(&vec![0u8; pad])?;
         }
+        Ok(())
+    }
+
+    /// Fill the fixed fields of a header, compute and store its
+    /// checksum, and write it out.
+    fn finish_header(&mut self, header: &mut [u8; 512], typeflag: u8, size: usize) -> Result<()> {
+        let mode = match typeflag {
+            b'5' => b"0000755\x00",
+            _ => b"0000644\x00",
+        };
+        header[100..108].copy_from_slice(mode);
+        header[108..116].copy_from_slice(b"0000000\x00"); // uid
+        header[116..124].copy_from_slice(b"0000000\x00"); // gid
+        let size_field = format!("{size:011o}\x00");
+        header[124..136].copy_from_slice(size_field.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\x00"); // mtime
+        header[148..156].copy_from_slice(b"        "); // checksum placeholder
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\x00");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
+        let cs = format!("{checksum:06o}\x00 ");
+        header[148..156].copy_from_slice(cs.as_bytes());
+        self.out.write_all(header)?;
         Ok(())
     }
 }
@@ -1291,6 +1809,26 @@ fn find_pack_root(tmp: &Path) -> Result<PathBuf> {
     Ok(tmp.to_path_buf())
 }
 
+/// Walk down the chain of single subdirectories (up to three levels)
+/// from an extracted archive to its inner root — the GitHub `repo-ref/`
+/// wrapper in the common case. Unlike [`find_pack_root`] this does not
+/// look at manifests: it is for locating known paths inside the archive.
+fn archive_root(tmp: &Path) -> PathBuf {
+    let mut cur = tmp.to_path_buf();
+    for _ in 0..3 {
+        let Ok(entries) = fs::read_dir(&cur) else {
+            break;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        if entries.len() == 1 && entries[0].file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            cur = entries.remove(0).path();
+        } else {
+            break;
+        }
+    }
+    cur
+}
+
 /// Create (if missing) a GitHub release and upload `bytes` as an asset.
 /// Requires a token in `GITHUB_TOKEN` (or `TYPSHIP_TOKEN`).
 fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -> Result<()> {
@@ -1304,14 +1842,13 @@ fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -
     let api = format!("https://api.github.com/repos/{repo}/releases");
     // Find an existing release by tag; only a 404 leads to creating one.
     let existing = agent()
-        .get(&format!("{api}/tags/{tag}"))
+        .get(&format!("{api}/tags/{}", percent_encode(tag)))
         .set("Authorization", &format!("Bearer {token}"))
         .call();
     let upload_url = match existing {
         Ok(resp) => {
             let body = resp.into_string().context("reading release response")?;
-            json_object_string_field(&body, "upload_url")
-                .ok_or_else(|| anyhow!("release for tag `{tag}` has no upload_url"))?
+            release_upload_url(&body, tag)?
         }
         Err(ureq::Error::Status(404, _)) => {
             let body = format!(
@@ -1326,8 +1863,7 @@ fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -
                 .send_string(&body)
                 .map_err(|e| anyhow!("creating release {tag} on {repo}: {e}"))?;
             let text = resp.into_string().context("reading release response")?;
-            json_object_string_field(&text, "upload_url")
-                .ok_or_else(|| anyhow!("created release has no upload_url"))?
+            release_upload_url(&text, tag)?
         }
         Err(e) => return Err(anyhow!("looking up release {tag} on {repo} failed: {e}")),
     };
@@ -1342,6 +1878,16 @@ fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -
         .send_bytes(bytes)
         .map_err(|e| anyhow!("uploading asset {asset_name}: {e}"))?;
     Ok(())
+}
+
+/// Extract `upload_url` from a parsed release document.
+fn release_upload_url(body: &str, tag: &str) -> Result<String> {
+    let value = json::parse(body).map_err(|e| anyhow!("invalid release JSON: {e}"))?;
+    value
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("release for tag `{tag}` has no upload_url"))
 }
 
 /// JSON string escape for embedding a value into a JSON document.
@@ -1373,51 +1919,6 @@ fn percent_encode(s: &str) -> String {
         }
     }
     out
-}
-
-/// Pull the string value of `key` out of a JSON object without a JSON
-/// dependency (not allowed by the proposal). Tolerates whitespace around
-/// the colon and unescapes the value; returns `None` when the key is
-/// absent or its value is not a string.
-fn json_object_string_field(body: &str, key: &str) -> Option<String> {
-    let pat = format!("\"{key}\"");
-    let mut from = 0;
-    loop {
-        let pos = body[from..].find(&pat)?;
-        let rest = body[from + pos + pat.len()..].trim_start();
-        let rest = rest.strip_prefix(':')?.trim_start();
-        if !rest.starts_with('"') {
-            // A non-string value under this key: keep scanning.
-            from += pos + pat.len();
-            continue;
-        }
-        let val = &rest[1..];
-        let mut out = String::new();
-        let mut chars = val.char_indices();
-        while let Some((_, c)) = chars.next() {
-            match c {
-                '"' => return Some(out),
-                '\\' => {
-                    let (_, esc) = chars.next()?;
-                    match esc {
-                        'n' => out.push('\n'),
-                        't' => out.push('\t'),
-                        'r' => out.push('\r'),
-                        'u' => {
-                            let hex: String = (0..4)
-                                .filter_map(|_| chars.next().map(|(_, c)| c))
-                                .collect();
-                            let code = u32::from_str_radix(&hex, 16).ok()?;
-                            out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
-                        }
-                        other => out.push(other),
-                    }
-                }
-                c => out.push(c),
-            }
-        }
-        return None;
-    }
 }
 
 /// Link a named pack from `src` to `dst` instead of copying.
@@ -1534,6 +2035,10 @@ pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn parse_source_detects_shapes() {
@@ -1566,6 +2071,14 @@ mod tests {
         assert!(parse_source("@preview/foo:").is_err());
         assert!(parse_source("@preview/na/me").is_err());
         assert!(parse_source("@preview/").is_err());
+        // Dots and colons are not path-safe components.
+        assert!(parse_source("@preview/.").is_err());
+        assert!(parse_source("@./name").is_err());
+        // a colon splits name from version, so na:me parses as version `me`
+        assert!(matches!(
+            parse_source("@preview/na:me").unwrap(),
+            Source::Registry { name, version: Some(v), .. } if name == "na" && v == "me"
+        ));
     }
 
     #[test]
@@ -1609,6 +2122,16 @@ mod tests {
             parse_source("https://github.com/o/r/releases/tag/v2").unwrap(),
             Source::GithubRelease { tag: Some(t), .. } if t == "v2"
         ));
+        // `releases/tag/latest` is the literal tag, not the latest release.
+        assert!(matches!(
+            parse_source("https://github.com/o/r/releases/tag/latest").unwrap(),
+            Source::GithubRelease { tag: Some(t), .. } if t == "latest"
+        ));
+        // A tag with slashes survives whole.
+        match parse_source("https://github.com/o/r/releases/tag/v1/beta2").unwrap() {
+            Source::GithubRelease { tag: Some(t), .. } => assert_eq!(t, "v1/beta2"),
+            other => panic!("unexpected {other:?}"),
+        }
         // A plain repository URL stays HEAD-based.
         assert!(matches!(
             parse_source("https://github.com/o/r").unwrap(),
@@ -1651,22 +2174,49 @@ mod tests {
     }
 
     #[test]
+    fn extract_rejects_windows_hostile_paths() {
+        for evil in [
+            "a:stream.txt",  // NTFS alternate data stream
+            "CON/settings",  // reserved device name as a directory
+            "out/COM1.txt",  // reserved device name as a file stem
+            "out/lpt9.dat",  // case-insensitive reserved name
+            "out/trailing.", // trailing dot component
+            "out/trailing ", // trailing space component
+            "out//x.txt",    // empty component
+        ] {
+            assert!(safe_member_path(evil).is_err(), "case {evil:?}");
+        }
+        // Friendly names stay valid.
+        for ok in ["src/lib.typ", "out/CONCEPT.txt", "out/v1.0/read me.md"] {
+            assert!(safe_member_path(ok).is_ok(), "case {ok:?}");
+        }
+    }
+
+    #[test]
+    fn extract_rejects_non_utf8_member_names() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"\xff\xfe.txt", b'0', 1));
+        raw.extend_from_slice(b"x");
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-nu-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        assert!(extract_tarball(&gz, &dest, None).is_err());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn extract_rejects_huge_member_without_oom() {
         // A member claiming 8 GiB must be refused before allocation.
         let mut header = [0u8; 512];
         header[..3].copy_from_slice(b"big");
-        let size_field = format!("{:011o}\0", MAX_MEMBER_SIZE + 1);
+        let size_field = format!("{:011o}\x00", MAX_MEMBER_SIZE + 1);
         header[124..136].copy_from_slice(size_field.as_bytes());
         header[148..156].copy_from_slice(b"        ");
         header[156] = b'0';
         let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\0 ");
+        let cs = format!("{checksum:06o}\x00 ");
         header[148..156].copy_from_slice(cs.as_bytes());
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&header);
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&raw).unwrap();
-        let gz = enc.finish().unwrap();
+        let gz = gz_of_raw(&header);
         let dest = std::env::temp_dir().join(format!("typship-h-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
         assert!(extract_tarball(&gz, &dest, None).is_err());
@@ -1682,135 +2232,179 @@ mod tests {
         GzDecoder::new(&gz0[..]).read_to_end(&mut raw).unwrap();
         assert!(raw.len() > 160);
         raw[150] ^= 0xff;
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&raw).unwrap();
-        let gz = enc.finish().unwrap();
+        let mut gz = gz_of_raw(&raw);
         let dest = std::env::temp_dir().join(format!("typship-c-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
         assert!(extract_tarball(&gz, &dest, None).is_err());
-        let _ = fs::remove_dir_all(&dest);
         // A symlink member is rejected outright.
-        let mut header = [0u8; 512];
-        header[..4].copy_from_slice(b"link");
-        header[156] = b'2';
-        header[148..156].copy_from_slice(b"        ");
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\0 ");
-        header[148..156].copy_from_slice(cs.as_bytes());
-        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
-        enc.write_all(&header).unwrap();
-        let gz = enc.finish().unwrap();
+        gz = gz_of_raw(&raw_header(b"link", b'2', 0));
+        assert!(extract_tarball(&gz, &dest, None).is_err());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn malformed_gzip_and_tar_frames_are_errors() {
+        let dest = std::env::temp_dir().join(format!("typship-g-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        // A complete entry without the end-of-archive marker.
+        let no_end = {
+            let enc = GzEncoder::new(Vec::new(), Compression::default());
+            let mut tar = TarWriter { out: enc };
+            tar.write_entry("a.txt", false, b"x").unwrap();
+            tar.out.finish().unwrap()
+        };
+        assert!(
+            extract_tarball(&no_end, &dest, None).is_err(),
+            "no end marker"
+        );
+        // An empty gzip payload.
+        let empty = GzEncoder::new(Vec::new(), Compression::default())
+            .finish()
+            .unwrap();
+        assert!(extract_tarball(&empty, &dest, None).is_err(), "empty gzip");
+        // Trailing garbage after the gzip member.
+        let mut garbage = gz_of(&[("a.txt", b"x")]);
+        garbage.extend_from_slice(b"CORRUPT");
+        assert!(
+            extract_tarball(&garbage, &dest, None).is_err(),
+            "trailing garbage"
+        );
+        // Non-gzip junk at all.
+        assert!(
+            extract_tarball(b"plain text", &dest, None).is_err(),
+            "plain text"
+        );
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn metadata_headers_count_against_the_entry_budget() {
+        // MAX_ARCHIVE_ENTRIES + 1 metadata headers must be refused.
+        let mut raw = Vec::new();
+        for i in 0..(MAX_ARCHIVE_ENTRIES + 1) {
+            raw.extend_from_slice(&raw_header(format!("pax{i}").as_bytes(), b'x', 0));
+        }
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-mb-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
         assert!(extract_tarball(&gz, &dest, None).is_err());
         let _ = fs::remove_dir_all(&dest);
     }
 
     #[test]
-    fn roundtrip_preserves_structure() {
-        let base = std::env::temp_dir().join(format!("typship-r-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-
-        // 1. A pack with a manifest: contents land at the destination top.
-        let src = base.join("a");
-        fs::create_dir_all(src.join("src")).unwrap();
-        fs::write(src.join("typst.toml"), "manifest").unwrap();
-        fs::write(src.join("src/main.typ"), "#set page()").unwrap();
-        let gz = pack_tarball(&src).unwrap();
-        let dst = base.join("b1");
-        extract_tarball(&gz, &base.join("t1"), None).unwrap();
-        let root = find_pack_root(&base.join("t1")).unwrap();
-        copy_tree(&root, &dst).unwrap();
-        assert!(dst.join("typst.toml").is_file());
-        assert!(dst.join("src/main.typ").is_file());
-
-        // 2. A directory without a manifest keeps its structure exactly.
-        let src = base.join("c");
-        fs::create_dir_all(src.join("src")).unwrap();
-        fs::write(src.join("src/main.typ"), "x").unwrap();
-        let gz = pack_tarball(&src).unwrap();
-        let dst = base.join("b2");
-        extract_tarball(&gz, &base.join("t2"), None).unwrap();
-        let root = find_pack_root(&base.join("t2")).unwrap();
-        copy_tree(&root, &dst).unwrap();
-        assert!(dst.join("src/main.typ").is_file());
-        assert!(!dst.join("main.typ").is_file());
-
-        // 3. A single-file directory survives as that file.
-        let src = base.join("d");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("main.typ"), "y").unwrap();
-        let gz = pack_tarball(&src).unwrap();
-        let dst = base.join("b3");
-        extract_tarball(&gz, &base.join("t3"), None).unwrap();
-        let root = find_pack_root(&base.join("t3")).unwrap();
-        copy_tree(&root, &dst).unwrap();
-        assert!(dst.join("main.typ").is_file());
-
-        // 4. A wrapper archive: the manifest marks the pack root.
-        let wrapped = base.join("w");
-        fs::create_dir_all(wrapped.join("repo").join("src")).unwrap();
-        fs::write(wrapped.join("repo").join("typst.toml"), "m").unwrap();
-        fs::write(wrapped.join("repo").join("src/lib.typ"), "z").unwrap();
-        let gz = pack_tarball(&wrapped).unwrap();
-        let dst = base.join("b4");
-        extract_tarball(&gz, &base.join("t4"), None).unwrap();
-        let root = find_pack_root(&base.join("t4")).unwrap();
-        copy_tree(&root, &dst).unwrap();
-        assert!(dst.join("typst.toml").is_file());
-        assert!(dst.join("src/lib.typ").is_file());
-
-        let _ = fs::remove_dir_all(&base);
+    fn pax_path_record_is_parsed_by_length() {
+        // A well-formed PAX header whose path record carries a slash
+        // tag-like value, plus a decoy `n path=evil` text line inside
+        // another record that must not win.
+        let payload = b"22 path=real/name.typ\n13 y=x path=\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"PaxHeader", b'x', payload.len()));
+        raw.extend_from_slice(payload);
+        let pad = (512 - (payload.len() % 512)) % 512;
+        raw.extend_from_slice(&vec![0u8; pad]);
+        raw.extend_from_slice(&raw_header(b"ignored", b'0', 0));
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        let entries = decode_tar(&gz).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "real/name.typ");
     }
 
     #[test]
-    fn utf8_and_long_names_survive_the_roundtrip() {
-        let base = std::env::temp_dir().join(format!("typship-u-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        let src = base.join("a");
-        fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("中文.typ"), "hello").unwrap();
-        let long = format!("{}.typ", "l".repeat(150));
-        fs::write(src.join(&long), "long").unwrap();
-        let gz = pack_tarball(&src).unwrap();
-        let dst = base.join("b");
-        extract_tarball(&gz, &dst, None).unwrap();
-        assert_eq!(fs::read(dst.join("中文.typ")).unwrap(), b"hello");
-        assert_eq!(fs::read(dst.join(&long)).unwrap(), b"long");
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn truncated_and_ungzipped_bodies_are_errors() {
-        let gz = gz_of(&[("a.txt", &[0u8; 600])]);
-        // Cut the archive short: the entry data cannot be fully read.
-        let cut = &gz[..gz.len() - 40];
-        let dest = std::env::temp_dir().join(format!("typship-t-{}", std::process::id()));
-        fs::create_dir_all(&dest).unwrap();
-        assert!(extract_tarball(cut, &dest, None).is_err());
-        let _ = fs::remove_dir_all(&dest);
-        // Not gzip at all.
-        assert!(extract_tarball(b"plain text", &dest, None).is_err());
-        let _ = fs::remove_dir_all(&dest);
-    }
-
-    #[test]
-    fn json_field_extraction_tolerates_spaces_and_escapes() {
-        let body = r#"{"upload_url": "https://u/?name=x", "quote": "a\"b", "n": 5}"#;
+    fn read_body_capped_refuses_over_long_bodies() {
         assert_eq!(
-            json_object_string_field(body, "upload_url").unwrap(),
-            "https://u/?name=x"
+            read_body_capped(&b"hello"[..], 5, "u").unwrap(),
+            b"hello".to_vec()
         );
-        assert_eq!(json_object_string_field(body, "quote").unwrap(), "a\"b");
-        assert!(json_object_string_field(body, "missing").is_none());
+        assert!(read_body_capped(&b"hello"[..], 4, "u").is_err());
+        assert!(read_body_capped(std::io::repeat(b'x'), 1024, "u").is_err());
     }
 
     #[test]
-    fn index_scan_is_order_and_space_tolerant() {
+    fn http_404_fails_immediately_without_retry() {
+        let (url, count) = mock_server(&[(404, "nope")]);
+        assert!(fetch_bytes(&format!("{url}/index.json")).is_err());
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn http_5xx_is_retried_until_success() {
+        let (url, count) = mock_server(&[(500, "a"), (500, "b"), (200, "ok")]);
+        let body = fetch_bytes(&format!("{url}/index.json")).unwrap();
+        assert_eq!(body, b"ok".to_vec());
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn non_gzip_tarball_body_is_a_permanent_failure() {
+        let (url, count) = mock_server(&[(200, "<html>not gzip</html>")]);
+        match get_tarball(&format!("{url}/x.tar.gz")) {
+            Err(FetchError::Fatal(_)) => {}
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn json_parser_reads_nested_objects_and_real_keys() {
+        let text =
+            r#"{"description":"name","a":{"name":"inner","n":[1,2,{"name":"deep"}]},"name":"top"}"#;
+        let v = json::parse(text).unwrap();
+        assert_eq!(v.get("name").unwrap().as_str(), Some("top"));
+        assert_eq!(v.get("description").unwrap().as_str(), Some("name"));
+        assert_eq!(
+            v.get("a").unwrap().get("name").unwrap().as_str(),
+            Some("inner")
+        );
+        assert_eq!(v.get("a").unwrap().find_str("name"), Some("inner"));
+        // find_str returns the first hit in document order.
+        assert_eq!(v.find_str("name"), Some("inner"));
+        // Malformed documents are rejected, not scanned.
+        assert!(json::parse("{\"a\":}").is_err());
+        assert!(json::parse("{\"a\":1} trailing").is_err());
+    }
+
+    #[test]
+    fn json_parser_handles_escapes_and_surrogate_pairs() {
+        let v = json::parse(r#"{"s":"a\"b\\c\n\t😀"}"#).unwrap();
+        assert_eq!(v.get("s").unwrap().as_str(), Some("a\"b\\c\n\t😀"));
+        assert!(json::parse(r#""\ud83d""#).is_err()); // unpaired surrogate
+    }
+
+    #[test]
+    fn index_latest_comes_from_the_production_parser() {
         let body = r#"[ {"version": "0.2.0", "name": "foo"} ,{"name":"foo","version":"0.10.0"},{"name":"bar","version":"9.9.9"} ]"#;
-        assert_eq!(latest_index_scan(body, "foo").unwrap(), "0.10.0");
-        assert!(latest_index_scan(body, "nope").is_err());
+        assert_eq!(latest_from_index_json(body, "foo").unwrap(), "0.10.0");
+        assert!(latest_from_index_json(body, "nope").is_err());
+        // Not an array.
+        assert!(latest_from_index_json(r#"{"name":"foo"}"#, "foo").is_err());
+    }
+
+    #[test]
+    fn release_asset_selection_uses_the_parsed_document() {
+        let body = r#"{"tag_name":"v1.2.3","assets":[{"name":"nope.zip","browser_download_url":"https://x/nope.zip"},{"name":"p.tar.gz","browser_download_url":"https://x/p.tar.gz"}]}"#;
+        let v = json::parse(body).unwrap();
+        assert_eq!(
+            release_archive_asset(&v).as_deref(),
+            Some("https://x/p.tar.gz")
+        );
+        assert_eq!(v.get("tag_name").unwrap().as_str(), Some("v1.2.3"));
+        let empty = json::parse(r#"{"tag_name":"v1","assets":[]}"#).unwrap();
+        assert!(release_archive_asset(&empty).is_none());
+    }
+
+    #[test]
+    fn release_upload_url_extraction_rejects_non_objects() {
+        assert_eq!(
+            release_upload_url(
+                r#"{"upload_url": "https://uploads.github.com/u{?name,label}"}"#,
+                "v1"
+            )
+            .unwrap(),
+            "https://uploads.github.com/u{?name,label}"
+        );
+        assert!(release_upload_url(r#""just a string""#, "v1").is_err());
     }
 
     #[test]
@@ -1824,10 +2418,22 @@ mod tests {
         assert!(ensure_distinct(&src, &src.join("out").join("b")).is_err());
         // src inside dst
         assert!(ensure_distinct(&src, &base).is_err());
-        // same
-        assert!(ensure_distinct(&src, &src).is_err());
+        // same, expressed through dot segments
+        assert!(ensure_distinct(&src, &src.join(".").join(".")).is_err());
         // unrelated: fine
         assert!(ensure_distinct(&src, &base.join("b")).is_ok());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn copy_refuses_alias_destinations_through_dots() {
+        // A destination written with .. segments must not slip past the
+        // inside-source check.
+        let base = std::env::temp_dir().join(format!("typship-d2-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(src.join("out")).unwrap();
+        assert!(ensure_distinct(&src, &src.join("out").join("..").join("inside")).is_err());
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -1847,34 +2453,96 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    /// Build a gzipped tar from (path, data) pairs through the writer.
-    fn gz_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let enc = GzEncoder::new(Vec::new(), Compression::default());
-        let mut tar = TarWriter { out: enc };
-        for (path, data) in entries {
-            tar.write_entry(path, false, data).unwrap();
-        }
-        tar.write_end_blocks().unwrap();
-        tar.out.finish().unwrap()
+    #[test]
+    fn link_accepts_relative_input_paths() {
+        // Both ends given as relative paths (resolved against the cwd,
+        // which for tests is the crate directory). The created link must
+        // still point at the real source.
+        let base = PathBuf::from("target").join(format!("typship-lr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f.txt"), "x").unwrap();
+        let dst = base.join("b");
+        let src_rel = format!("./{}", src.to_string_lossy().replace('\\', "/"));
+        let dst_rel = format!("./{}", dst.to_string_lossy().replace('\\', "/"));
+        link(&src_rel, &dst_rel, None).unwrap();
+        assert!(dst.join("f.txt").is_file());
+        let _ = fs::remove_dir_all(&base);
     }
 
-    /// A trimmed re-implementation of the index scan used by tests.
-    fn latest_index_scan(body: &str, name: &str) -> Result<String> {
-        let mut best: Option<(Vec<u64>, String)> = None;
-        for chunk in body.split('}') {
-            if json_object_string_field(chunk, "name").as_deref() != Some(name) {
-                continue;
-            }
-            if let Some(v) = json_object_string_field(chunk, "version") {
-                let nums: Vec<u64> = v
-                    .split('.')
-                    .map(|p| p.parse::<u64>().unwrap_or(0))
-                    .collect();
-                if best.as_ref().is_none_or(|(b, _)| nums > *b) {
-                    best = Some((nums, v));
-                }
-            }
+    /// Build a gzipped tar from (path, data) pairs through the writer.
+    fn gz_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut raw = Vec::new();
+        for (path, data) in entries {
+            raw.extend_from_slice(&raw_header(path.as_bytes(), b'0', data.len()));
+            raw.extend_from_slice(data);
+            let pad = (512 - (data.len() % 512)) % 512;
+            raw.extend_from_slice(&vec![0u8; pad]);
         }
-        best.map(|(_, v)| v).ok_or_else(|| anyhow!("not found"))
+        raw.extend_from_slice(&[0u8; 1024]);
+        gz_of_raw(&raw)
+    }
+
+    /// Compress raw (uncompressed) tar bytes.
+    fn gz_of_raw(raw: &[u8]) -> Vec<u8> {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(raw).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// A valid ustar header with a computed checksum.
+    fn raw_header(name: &[u8], typeflag: u8, size: usize) -> [u8; 512] {
+        let mut header = [0u8; 512];
+        header[..name.len().min(100)].copy_from_slice(&name[..name.len().min(100)]);
+        let mode = if typeflag == b'5' {
+            b"0000755\x00"
+        } else {
+            b"0000644\x00"
+        };
+        header[100..108].copy_from_slice(mode);
+        header[108..116].copy_from_slice(b"0000000\x00");
+        header[116..124].copy_from_slice(b"0000000\x00");
+        let size_field = format!("{size:011o}\x00");
+        header[124..136].copy_from_slice(size_field.as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\x00");
+        header[148..156].copy_from_slice(b"        ");
+        header[156] = typeflag;
+        header[257..263].copy_from_slice(b"ustar\x00");
+        header[263..265].copy_from_slice(b"00");
+        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
+        let cs = format!("{checksum:06o}\x00 ");
+        header[148..156].copy_from_slice(cs.as_bytes());
+        header
+    }
+
+    /// A tiny HTTP server answering a scripted sequence of
+    /// (status, body) responses (the last one repeats) and counting
+    /// the requests it served.
+    fn mock_server(responses: &[(u16, &str)]) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        let responses: Vec<(u16, String)> =
+            responses.iter().map(|(c, b)| (*c, b.to_string())).collect();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let idx = i.min(responses.len() - 1);
+                let (code, body) = &responses[idx];
+                count2.fetch_add(1, Ordering::SeqCst);
+                let reason = if *code == 200 { "OK" } else { "E" };
+                let resp = format!(
+                    "HTTP/1.1 {code} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), count)
     }
 }
