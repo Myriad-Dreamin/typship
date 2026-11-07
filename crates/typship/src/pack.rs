@@ -10,16 +10,16 @@
 //! Safety posture for untrusted archives: member paths are validated (no
 //! absolute paths, no `..`, no backslashes, no colons, no Windows device
 //! names, no trailing dots or spaces), member names must be UTF-8, the
-//! header checksum is verified, the gzip stream must end cleanly and the
-//! tar must contain an end-of-archive marker, and resource budgets bound
-//! the number of members (including metadata headers) and the total
-//! unpacked size. Link and device members are rejected outright.
+//! header checksum is verified, and a short member body is an error
+//! rather than a truncated file. Resource budgets were removed per admin
+//! direction 2026-11-08 ("不要做没必要的限制"): an archive is as large
+//! as it is. Link and device members are rejected outright.
 //!
 //! HTTP posture: only transient failures (transport errors, 429 and 5xx)
-//! are retried; other 4xx answers are a definitive miss, over-long
-//! response bodies are refused rather than truncated, and a non-gzip
+//! are retried; other 4xx answers are a definitive miss, and a non-gzip
 //! tarball body is a permanent failure that never triggers another
-//! request.
+//! request. Response bodies are read in full — no download cap (admin
+//! direction 2026-11-08, "不要做没必要的限制").
 
 use std::fs;
 use std::io::Read;
@@ -38,16 +38,6 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
 /// Attempts per HTTP request for transient failures only (4xx except 429
 /// fails immediately).
 const RETRIES: usize = 3;
-/// Maximum bytes of one HTTP response body we accept.
-const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
-/// Maximum number of real members accepted from one archive; PAX/GNU
-/// metadata headers are consumed inside the `tar` crate and only the
-/// total download size bounds their count.
-const MAX_ARCHIVE_ENTRIES: usize = 50_000;
-/// Maximum total uncompressed bytes accepted from one archive.
-const MAX_TOTAL_UNPACKED: u64 = 1024 * 1024 * 1024;
-/// Maximum size of a single archive member.
-const MAX_MEMBER_SIZE: u64 = 512 * 1024 * 1024;
 /// The manifest that marks the pack root inside an archive.
 const PACK_MANIFEST: &str = "typst.toml";
 
@@ -79,8 +69,6 @@ enum FetchError {
 /// Why reading a response body failed.
 #[derive(Debug)]
 enum BodyError {
-    /// The body exceeds the hard download cap: permanent.
-    TooLong,
     /// The connection died mid-body (or another I/O error): the
     /// request is worth retrying.
     Io(std::io::Error),
@@ -89,7 +77,6 @@ enum BodyError {
 impl std::fmt::Display for BodyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BodyError::TooLong => write!(f, "body exceeds the download limit"),
             BodyError::Io(e) => write!(f, "{e}"),
         }
     }
@@ -111,11 +98,9 @@ impl From<FetchError> for anyhow::Error {
     }
 }
 
-/// Read a response body with a hard size cap. The reader is capped at
-/// `limit + 1` bytes, so an over-long body is detected by its length
-/// alone — no truncation, no second probe read.
-fn read_body_capped(reader: impl Read, limit: u64, url: &str) -> Result<Vec<u8>, BodyError> {
-    let mut reader = reader.take(limit + 1);
+/// Read a response body in full. A connection death mid-body is an I/O
+/// error, which the retry loop treats as transient.
+fn read_body(mut reader: impl Read, url: &str) -> Result<Vec<u8>, BodyError> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).map_err(|e| {
         BodyError::Io(std::io::Error::new(
@@ -123,15 +108,11 @@ fn read_body_capped(reader: impl Read, limit: u64, url: &str) -> Result<Vec<u8>,
             format!("reading body of {url}: {e}"),
         ))
     })?;
-    if buf.len() as u64 > limit {
-        return Err(BodyError::TooLong);
-    }
     Ok(buf)
 }
 
 /// GET a URL to bytes, retrying only transient failures. A body read
-/// error is transient (the connection may have died mid-body) and is
-/// retried in the same loop; an over-long body is permanent.
+/// error is transient (the connection may have died mid-body).
 fn get_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
     let mut last = None;
     for attempt in 0..RETRIES {
@@ -139,14 +120,8 @@ fn get_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
             std::thread::sleep(Duration::from_millis(500 * attempt as u64));
         }
         match agent().get(url).call() {
-            Ok(resp) => match read_body_capped(resp.into_reader(), MAX_DOWNLOAD, url) {
+            Ok(resp) => match read_body(resp.into_reader(), url) {
                 Ok(bytes) => return Ok(bytes),
-                Err(BodyError::TooLong) => {
-                    return Err(FetchError::Fatal(format!(
-                        "body of {url} exceeds the {} MiB download limit",
-                        MAX_DOWNLOAD / (1024 * 1024)
-                    )));
-                }
                 Err(BodyError::Io(e)) => {
                     last = Some(FetchError::Transient(format!("GET {url}: body read: {e}")));
                 }
@@ -745,12 +720,8 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
         Source::Stdin => {
             let mut buf = Vec::new();
             std::io::stdin()
-                .take(MAX_DOWNLOAD + 1)
                 .read_to_end(&mut buf)
                 .context("reading tarball from stdin")?;
-            if buf.len() as u64 > MAX_DOWNLOAD {
-                bail!("stdin tarball exceeds the download limit");
-            }
             Ok(Materialized::Tarball(buf))
         }
         Source::Registry {
@@ -1116,31 +1087,11 @@ fn safe_member_path(path: &str) -> Result<String> {
 /// stripped here; the pack root is located afterwards by
 /// [`find_pack_root`].
 pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<()> {
-    extract_tarball_with_limits(
-        gz,
-        dest,
-        subpath,
-        MAX_ARCHIVE_ENTRIES,
-        MAX_TOTAL_UNPACKED,
-        MAX_MEMBER_SIZE,
-    )
-}
-
-/// The testable core of [`extract_tarball`]: identical behaviour with the
-/// resource budgets injected, so the accumulation logic can be exercised at
-/// small scales.
-pub fn extract_tarball_with_limits(
-    gz: &[u8],
-    dest: &Path,
-    subpath: Option<&str>,
-    max_entries: usize,
-    max_total: u64,
-    max_member: u64,
-) -> Result<()> {
     // The `tar` crate verifies checksums and handles ustar/GNU/PAX long
-    // names; this loop enforces the resource budgets, the member-type
-    // allowlist (plain files and directories only) and the archive-path
-    // validation, then writes each member out itself.
+    // names; this loop enforces the member-type allowlist (plain files
+    // and directories only) and the archive-path validation, then writes
+    // each member out itself. No resource budgets: an archive is as
+    // large as it is (admin direction 2026-11-08, "不要做没必要的限制").
     let mut gz = MultiGzDecoder::new(gz);
     {
         let mut archive = tar::Archive::new(&mut gz);
@@ -1148,34 +1099,14 @@ pub fn extract_tarball_with_limits(
         // this the crate stops after the FIRST zero block, and trailing
         // garbage after the gzip member would go unnoticed.
         archive.set_ignore_zeros(true);
-        let mut members_seen = 0usize;
-        let mut total = 0u64;
         for entry in archive.entries().context("reading tar entries")? {
             let mut entry = entry.with_context(|| "malformed tar entry")?;
-            members_seen += 1;
-            if members_seen > max_entries {
-                bail!("archive has too many entries (limit {max_entries})");
-            }
             let etype = entry.header().entry_type();
             if !matches!(
                 etype,
                 tar::EntryType::Regular | tar::EntryType::Directory | tar::EntryType::Continuous
             ) {
                 bail!("tar member is a {etype:?}; link/device members are not supported");
-            }
-            let size = entry.header().size().context("invalid tar member size")?;
-            if size > max_member {
-                bail!(
-                    "tar member of {size} bytes exceeds the {} MiB member limit",
-                    max_member / (1024 * 1024)
-                );
-            }
-            total += size;
-            if total > max_total {
-                bail!(
-                    "archive exceeds the total unpacked limit of {} MiB",
-                    max_total / (1024 * 1024)
-                );
             }
             let raw_path = entry.path().context("invalid tar member path")?;
             let path = raw_path
@@ -1206,6 +1137,7 @@ pub fn extract_tarball_with_limits(
                 if let Some(parent) = out.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                let size = entry.header().size().context("invalid tar member size")?;
                 // The header's size bounds the read; a short body is an
                 // error, never a truncated file.
                 let mut data = Vec::new();
@@ -1777,25 +1709,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_huge_member_without_oom() {
-        // A member claiming 8 GiB must be refused before allocation.
-        let mut header = [0u8; 512];
-        header[..3].copy_from_slice(b"big");
-        let size_field = format!("{:011o}\x00", MAX_MEMBER_SIZE + 1);
-        header[124..136].copy_from_slice(size_field.as_bytes());
-        header[148..156].copy_from_slice(b"        ");
-        header[156] = b'0';
-        let checksum = header.iter().map(|&b| b as u64).sum::<u64>();
-        let cs = format!("{checksum:06o}\x00 ");
-        header[148..156].copy_from_slice(cs.as_bytes());
-        let gz = gz_of_raw(&header);
-        let dest = std::env::temp_dir().join(format!("typship-h-{}", std::process::id()));
-        fs::create_dir_all(&dest).unwrap();
-        assert!(extract_tarball(&gz, &dest, None).is_err());
-        let _ = fs::remove_dir_all(&dest);
-    }
-
-    #[test]
     fn extract_rejects_bad_checksum_and_symlink_members() {
         // Corrupt the checksum of a valid header, on the uncompressed
         // stream: byte 150 sits inside the 148..156 checksum field.
@@ -1838,11 +1751,10 @@ mod tests {
     #[test]
     fn dangling_metadata_headers_are_refused() {
         // tar crate 内部把 PAX/GNU 长名元数据头并入下一成员，不再作为
-        // 独立条目产出，因此条数预算只数真实成员（元数据头总量由下载
-        // 体积上限兜底：512 字节/头 × MAX_DOWNLOAD 封顶）。但「元数据头
-        // 之后没有成员」仍是错误，不得静默吞掉。
+        // 独立条目产出。但「元数据头之后没有成员」仍是错误，不得静默
+        // 吞掉。
         let mut raw = Vec::new();
-        for i in 0..(MAX_ARCHIVE_ENTRIES + 1) {
+        for i in 0..3 {
             raw.extend_from_slice(&raw_header(format!("pax{i}").as_bytes(), b'x', 0));
         }
         raw.extend_from_slice(&[0u8; 1024]);
@@ -1859,16 +1771,6 @@ mod tests {
     // pending_name_overrides_never_leak_to_the_next_member、
     // single_zero_block_is_not_a_complete_end_marker）随之删除；
     // crate 对「缺结束块」静默接受的严格性让渡也已记录在案。
-
-    #[test]
-    fn read_body_capped_refuses_over_long_bodies() {
-        assert_eq!(
-            read_body_capped(&b"hello"[..], 5, "u").unwrap(),
-            b"hello".to_vec()
-        );
-        assert!(read_body_capped(&b"hello"[..], 4, "u").is_err());
-        assert!(read_body_capped(std::io::repeat(b'x'), 1024, "u").is_err());
-    }
 
     #[test]
     fn http_404_fails_immediately_without_retry() {
@@ -2174,52 +2076,8 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[test]
-    fn total_unpack_budget_accumulates_regular_files() {
-        // Resource budgets are injected at test scale via
-        // extract_tarball_with_limits; production uses the constants via
-        // extract_tarball.
-        let limits = (100usize, 600u64, 10_000u64);
-        let dest = std::env::temp_dir().join(format!("typship-budget-{}", std::process::id()));
-        fs::create_dir_all(&dest).unwrap();
-        // Three 300-byte files: 900 total, over the 600-byte budget.
-        let mut raw = Vec::new();
-        for i in 0..3 {
-            raw.extend_from_slice(&raw_header(format!("f{i}.txt").as_bytes(), b'0', 300));
-            raw.extend_from_slice(&vec![b'a'; 300]);
-            raw.extend_from_slice(&vec![0u8; 512 - 300]);
-        }
-        raw.extend_from_slice(&[0u8; 1024]);
-        let gz = gz_of_raw(&raw);
-        assert!(
-            extract_tarball_with_limits(&gz, &dest, None, limits.0, limits.1, limits.2).is_err(),
-            "over budget"
-        );
-        // Two files fit under the budget.
-        let mut raw = Vec::new();
-        for i in 0..2 {
-            raw.extend_from_slice(&raw_header(format!("f{i}.txt").as_bytes(), b'0', 300));
-            raw.extend_from_slice(&vec![b'a'; 300]);
-            raw.extend_from_slice(&vec![0u8; 512 - 300]);
-        }
-        raw.extend_from_slice(&[0u8; 1024]);
-        let gz = gz_of_raw(&raw);
-        assert!(
-            extract_tarball_with_limits(&gz, &dest, None, limits.0, limits.1, limits.2).is_ok(),
-            "within budget"
-        );
-        let _ = fs::remove_dir_all(&dest);
-    }
-
-    #[test]
-    fn http_403_is_permanent_and_never_retried() {
-        let (url, count) = mock_server(&[(403, "forbidden")]);
-        match get_bytes(&format!("{url}/private")) {
-            Err(FetchError::Fatal(_)) => {}
-            other => panic!("expected Fatal, got {other:?}"),
-        }
-        assert_eq!(count.load(Ordering::SeqCst), 1);
-    }
+    // 资源预算（条数/总量/单成员/下载上限）已按 admin 指示（2026-11-08「不要做没必要的限制」）整体移除，原预算测试随之删除；
+    // 剩下防线＝成员类型白名单、路径校验、短读检查与流尾校验。
 
     #[test]
     fn truncated_body_is_retried_until_success() {
