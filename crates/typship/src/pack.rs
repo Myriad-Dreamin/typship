@@ -488,30 +488,6 @@ fn strip_verbatim(text: String) -> String {
     text
 }
 
-/// Collapse `.` and `..` components lexically; a leading `..` at the
-/// filesystem root is kept (it cannot go higher).
-fn fold_dots(p: &Path) -> PathBuf {
-    let mut comps: Vec<Component> = Vec::new();
-    for c in p.components() {
-        match c {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let popped = matches!(
-                    comps.last(),
-                    Some(Component::Normal(_)) | Some(Component::ParentDir)
-                );
-                if popped {
-                    comps.pop();
-                } else {
-                    comps.push(c);
-                }
-            }
-            other => comps.push(other),
-        }
-    }
-    comps.into_iter().collect()
-}
-
 /// The physical path of `p` as far as the filesystem can tell: the
 /// longest existing ancestor is canonicalized (resolving symlinks,
 /// junctions and case differences) and the remaining suffix joined back
@@ -571,8 +547,8 @@ fn is_prefix(child: &Path, parent: &Path) -> bool {
 /// junctions, symlinks and case aliases cannot slip past) and compared
 /// component-wise.
 fn ensure_distinct(src: &Path, dst: &Path) -> Result<()> {
-    let s = fold_dots(&physical(src));
-    let d = fold_dots(&physical(dst));
+    let s = path_clean::clean(physical(src));
+    let d = path_clean::clean(physical(dst));
     if same_path(&s, &d) {
         bail!(
             "source and destination are the same directory `{}`",
@@ -596,37 +572,16 @@ fn ensure_distinct(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The per-user Typst packages directory.
+/// The per-user Typst packages directory; the well-known directory
+/// lookup is delegated to the `dirs` crate (LOCALAPPDATA on Windows,
+/// XDG_DATA_HOME or the platform default elsewhere).
 fn typst_packages_dir() -> Result<PathBuf> {
     #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var("LOCALAPPDATA").map_err(|_| anyhow!("LOCALAPPDATA not set"))?;
-        Ok(PathBuf::from(base).join("typst").join("packages"))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let base = match std::env::var("XDG_DATA_HOME") {
-            Ok(x) if !x.is_empty() => PathBuf::from(x),
-            _ => {
-                let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-            }
-        };
-        Ok(base.join("typst").join("packages"))
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let base = match std::env::var("XDG_DATA_HOME") {
-            Ok(x) if !x.is_empty() => PathBuf::from(x),
-            _ => {
-                let home = std::env::var("HOME").map_err(|_| anyhow!("HOME not set"))?;
-                PathBuf::from(home).join(".local").join("share")
-            }
-        };
-        Ok(base.join("typst").join("packages"))
-    }
+    let base = dirs::data_local_dir();
+    #[cfg(not(target_os = "windows"))]
+    let base = dirs::data_dir();
+    let base = base.ok_or_else(|| anyhow!("cannot determine the per-user data directory"))?;
+    Ok(base.join("typst").join("packages"))
 }
 
 /// Pick the greatest version-like directory name under `dir`.
@@ -974,6 +929,78 @@ fn find_dir(root: &Path, rel: &str) -> Option<PathBuf> {
 }
 
 /// A fresh private temporary directory for this process.
+/// A per-invocation disambiguator for temporary names.
+fn temp_suffix() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// A directory that removes itself (best effort) when dropped. This
+/// mirrors the official typst package-store flow: materialize the
+/// contents in a temporary directory located directly next to the
+/// destination (so a later `rename` stays on one mount point), then
+/// move it into place atomically.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    /// A temp dir next to `path`'s parent, on the same mount point as
+    /// the final destination.
+    fn next_to(path: &Path, label: &str) -> Result<Self> {
+        let dir = path.with_file_name(format!(".typship-tmp-{label}-{}", temp_suffix()));
+        fs::create_dir(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Write `bytes` to `path` via a temp file next to it and an atomic
+/// rename: an interrupted write never leaves a partial tarball at the
+/// destination, and a completed one appears atomically.
+fn write_tarball_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let tmp = path.with_file_name(format!(".typship-tmp-file-{}", temp_suffix()));
+    let outcome = (|| -> Result<()> {
+        fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        fs::rename(&tmp, path)
+            .with_context(|| format!("moving {} to {}", tmp.display(), path.display()))?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    outcome
+}
+
+/// Atomically move directory `from` onto `to` via rename. An existing
+/// empty destination directory is replaced; a non-empty one (including
+/// one that appeared concurrently) is an error, never a merge.
+fn move_dir_atomic(from: &Path, to: &Path) -> Result<()> {
+    if to.exists() {
+        if fs::read_dir(to)?.next().is_some() {
+            bail!("destination `{}` exists and is not empty", to.display());
+        }
+        fs::remove_dir(to).with_context(|| format!("removing empty {}", to.display()))?;
+    }
+    fs::rename(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))
+}
+
 fn temp_dir() -> Result<PathBuf> {
     let base = std::env::temp_dir();
     let dir = base.join(format!(
@@ -1272,35 +1299,45 @@ pub fn copy(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     let mat = materialize(&source, registry)?;
     match (mat, dest) {
         (Materialized::Tarball(bytes), Dest::Tarball(path)) => {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+            write_tarball_atomic(&path, &bytes)?;
         }
         (Materialized::Dir(dir), Dest::Tarball(path)) => {
             ensure_distinct(&dir, &path)?;
             let bytes = pack_tarball(&dir)?;
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+            write_tarball_atomic(&path, &bytes)?;
         }
         (Materialized::Tarball(bytes), Dest::Dir(path)) => {
             if path.exists() && fs::read_dir(&path)?.next().is_some() {
                 bail!("destination `{}` exists and is not empty", path.display());
             }
-            let tmp = temp_dir()?;
-            extract_tarball(&bytes, &tmp, None)?;
-            let inner = find_pack_root(&tmp)?;
-            copy_tree(&inner, &path)?;
-            let _ = fs::remove_dir_all(&tmp);
+            // typst-style atomicity: extract into a temp dir next to the
+            // destination (same mount point), then rename the pack root
+            // into place. A failed extraction leaves no trace at the
+            // destination; a completed one appears atomically.
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let tmp = TempDir::next_to(&path, "extract")?;
+            extract_tarball(&bytes, tmp.path(), None)?;
+            let inner = find_pack_root(tmp.path())?;
+            move_dir_atomic(&inner, &path)?;
         }
         (Materialized::Dir(dir), Dest::Dir(path)) => {
             ensure_distinct(&dir, &path)?;
             if path.exists() && fs::read_dir(&path)?.next().is_some() {
                 bail!("destination `{}` exists and is not empty", path.display());
             }
-            copy_tree(&dir, &path)?;
+            // typst-style atomicity: copy into a temp dir next to the
+            // destination (same mount point), then rename into place --
+            // an interrupted copy never leaves a half-populated pack.
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            let tmp = TempDir::next_to(&path, "copy")?;
+            copy_tree(&dir, tmp.path())?;
+            move_dir_atomic(tmp.path(), &path)?;
         }
         (mat, Dest::Release { repo, tag }) => {
             let bytes = match mat {

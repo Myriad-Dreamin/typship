@@ -41,6 +41,10 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 ## url utilities: percent-encoding
 percent-encoding = "2"
+path-clean = "1"
+## well-known directories
+## (typst packages dir, replacing hand-written env probing)
+dirs = "5"
 
 # network (TLS) and compression only, per proposal #119; tar/serde_json/
 # percent-encoding/toml all read or write with standard crates
