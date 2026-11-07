@@ -1800,20 +1800,13 @@ impl TarWriter {
                 header[..short.len()].copy_from_slice(short.as_bytes());
             }
             None => {
-                // Not splittable into ustar fields: emit a POSIX PAX
-                // extended header carrying the real path (standard
-                // format, not a GNU private extension), then the member
-                // header. The fallback header name is a placeholder; cut
-                // it at a UTF-8 character boundary so the reader (which
-                // ignores it in favour of the PAX path) never sees
-                // broken text.
-                self.write_pax_path(&name)?;
-                let nb = name.as_bytes();
-                let mut cut = nb.len().min(100);
-                while cut > 0 && (nb[cut] & 0xC0) == 0x80 {
-                    cut -= 1;
-                }
-                header[..cut].copy_from_slice(&nb[..cut]);
+                // Not splittable into ustar fields (the name part would
+                // exceed 100 bytes even after a 155-byte prefix): refuse
+                // rather than emit any extended-header entry — the
+                // writer creates plain files and directories only.
+                bail!(
+                    "archive path `{name}` is too long for the ustar layout (over 100 bytes after a 155-byte prefix); no such file will be written"
+                );
             }
         }
         self.finish_header(&mut header, if is_dir { b'5' } else { b'0' }, data.len())?;
@@ -1821,32 +1814,6 @@ impl TarWriter {
             self.out.write_all(data)?;
             self.write_padding(data.len())?;
         }
-        Ok(())
-    }
-
-    /// Emit a POSIX PAX extended-header entry (`x`) whose `path` record
-    /// carries `name`. The record follows the PAX framing exactly:
-    /// `<len> path=<value>\n`, where `<len>` counts the whole record.
-    fn write_pax_path(&mut self, name: &str) -> Result<()> {
-        // The path value must itself be a valid archive path (no NUL).
-        let body = format!("path={name}\n");
-        // Solve the fixed point: the declared length includes its own
-        // decimal width and the separating space.
-        let mut total = body.len() + 2;
-        loop {
-            let next = total.to_string().len() + 1 + body.len();
-            if next == total {
-                break;
-            }
-            total = next;
-        }
-        let payload = format!("{total} {body}");
-        debug_assert_eq!(payload.len(), total);
-        let mut header = [0u8; 512];
-        header[..2].copy_from_slice(b"./");
-        self.finish_header(&mut header, b'x', payload.len())?;
-        self.out.write_all(payload.as_bytes())?;
-        self.write_padding(payload.len())?;
         Ok(())
     }
 
@@ -2629,19 +2596,34 @@ mod tests {
     }
 
     #[test]
-    fn writer_creates_no_special_format_entries() {
-        // The writer must only produce regular-file, directory and PAX
-        // extended-header (`x`) entries — never GNU long-name (`L`/
-        // `K`), link, device or other special members (admin review
-        // note: we do not create special-format files).
+    fn writer_refuses_unsplittable_long_paths() {
+        // An unsplittable over-long path would need an extended header:
+        // refused with a clear error instead (admin review note: we do
+        // not create special-format files).
         let base = std::env::temp_dir().join(format!("typship-sp-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let src = base.join("a");
         fs::create_dir_all(&src).unwrap();
-        fs::write(src.join("plain.txt"), "x").unwrap();
-        // A >100-byte unsplittable name forces the extended-header path.
         let long = format!("{}.typ", "l".repeat(150));
         fs::write(src.join(&long), "long").unwrap();
+        let err = pack_tarball(&src).unwrap_err().to_string();
+        assert!(err.contains("too long for the ustar layout"), "{err}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn writer_emits_only_plain_typeflags() {
+        let base = std::env::temp_dir().join(format!("typship-tf-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("plain.txt"), "x").unwrap();
+        fs::write(src.join("sub/deep.txt"), "y").unwrap();
+        // A long path that splits cleanly into a ustar prefix + name.
+        let long_dir = "d".repeat(60);
+        let long_name = format!("{}.typ", "n".repeat(90));
+        fs::create_dir_all(src.join(&long_dir)).unwrap();
+        fs::write(src.join(&long_dir).join(&long_name), "long").unwrap();
         let gz = pack_tarball(&src).unwrap();
         // Inspect the uncompressed tar stream's typeflags.
         let mut raw = Vec::new();
@@ -2657,17 +2639,17 @@ mod tests {
             flags.push(header[156]);
             pos += 512 + ((size as usize).div_ceil(512)) * 512;
         }
-        assert!(flags.contains(&b'x'), "PAX header expected: {flags:?}");
-        assert!(!flags.contains(&b'L'), "GNU long-name must not be emitted");
-        assert!(!flags.contains(&b'K'));
         assert!(
-            flags.iter().all(|f| matches!(f, b'0' | b'5' | b'x')),
-            "{flags:?}"
+            flags.iter().all(|f| matches!(f, b'0' | b'5')),
+            "only plain entries expected: {flags:?}"
         );
-        // The long name still round-trips through the standard PAX path.
+        // The long path round-trips through the ustar prefix split.
         let dst = base.join("out");
         extract_tarball(&gz, &dst, None).unwrap();
-        assert_eq!(fs::read(dst.join(&long)).unwrap(), b"long");
+        assert_eq!(
+            fs::read(dst.join(&long_dir).join(&long_name)).unwrap(),
+            b"long"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
@@ -2742,16 +2724,20 @@ mod tests {
         let src = base.join("a");
         fs::create_dir_all(&src).unwrap();
         fs::write(src.join("中文.typ"), "hello").unwrap();
-        // Long enough to take the PAX extended-header path, and
-        // multi-byte so a byte-truncated fallback header would break
-        // decoding.
-        let long = format!("{}.typ", "中".repeat(40));
-        fs::write(src.join(&long), "long").unwrap();
+        // A long multi-byte path that splits cleanly into a ustar
+        // prefix + name (prefix ≤155 bytes, name ≤100 bytes).
+        let long_dir = "目".repeat(40); // 120 bytes, fits the prefix
+        let long_name = format!("{}.typ", "录".repeat(30)); // 93 bytes, fits the name
+        fs::create_dir_all(src.join(&long_dir)).unwrap();
+        fs::write(src.join(&long_dir).join(&long_name), "long").unwrap();
         let gz = pack_tarball(&src).unwrap();
         let dst = base.join("b");
         extract_tarball(&gz, &dst, None).unwrap();
         assert_eq!(fs::read(dst.join("中文.typ")).unwrap(), b"hello");
-        assert_eq!(fs::read(dst.join(&long)).unwrap(), b"long");
+        assert_eq!(
+            fs::read(dst.join(&long_dir).join(&long_name)).unwrap(),
+            b"long"
+        );
         let _ = fs::remove_dir_all(&base);
     }
 
