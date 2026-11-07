@@ -66,15 +66,35 @@ fn agent() -> ureq::Agent {
 /// fall back to the next candidate, or to stop.
 #[derive(Debug)]
 enum FetchError {
-    /// The resource definitively does not exist (or another permanent
-    /// 4xx client error): retrying or another candidate may help, but
-    /// re-asking the same URL never will.
+    /// The resource definitively does not exist (HTTP 404): retrying
+    /// the same URL never helps, but a caller may fall back to another
+    /// candidate (e.g. the next ref interpretation of a tree URL).
     NotFound(String),
-    /// A permanent non-transport problem (e.g. the body is not a gzip
-    /// tarball): no retry and no fallback can fix it.
+    /// A permanent problem (other 4xx such as 401/403, a body over the
+    /// download cap, a non-gzip tarball): no retry and no fallback can
+    /// fix it.
     Fatal(String),
     /// A transport error, a 429 or a 5xx: worth retrying.
     Transient(String),
+}
+
+/// Why reading a response body failed.
+#[derive(Debug)]
+enum BodyError {
+    /// The body exceeds the hard download cap: permanent.
+    TooLong,
+    /// The connection died mid-body (or another I/O error): the
+    /// request is worth retrying.
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyError::TooLong => write!(f, "body exceeds the download limit"),
+            BodyError::Io(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 impl std::fmt::Display for FetchError {
@@ -96,23 +116,24 @@ impl From<FetchError> for anyhow::Error {
 /// Read a response body with a hard size cap. The reader is capped at
 /// `limit + 1` bytes, so an over-long body is detected by its length
 /// alone — no truncation, no second probe read.
-fn read_body_capped(reader: impl Read, limit: u64, url: &str) -> Result<Vec<u8>> {
+fn read_body_capped(reader: impl Read, limit: u64, url: &str) -> Result<Vec<u8>, BodyError> {
     let mut reader = reader.take(limit + 1);
     let mut buf = Vec::new();
-    reader
-        .read_to_end(&mut buf)
-        .with_context(|| format!("reading body of {url}"))?;
+    reader.read_to_end(&mut buf).map_err(|e| {
+        BodyError::Io(std::io::Error::new(
+            e.kind(),
+            format!("reading body of {url}: {e}"),
+        ))
+    })?;
     if buf.len() as u64 > limit {
-        bail!(
-            "body of {url} exceeds the {} MiB download limit",
-            limit / (1024 * 1024)
-        );
+        return Err(BodyError::TooLong);
     }
     Ok(buf)
 }
 
 /// GET a URL to bytes, retrying only transient failures. A body read
-/// error is treated as transient: the connection may have died mid-body.
+/// error is transient (the connection may have died mid-body) and is
+/// retried in the same loop; an over-long body is permanent.
 fn get_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
     let mut last = None;
     for attempt in 0..RETRIES {
@@ -120,15 +141,27 @@ fn get_bytes(url: &str) -> Result<Vec<u8>, FetchError> {
             std::thread::sleep(Duration::from_millis(500 * attempt as u64));
         }
         match agent().get(url).call() {
-            Ok(resp) => {
-                return read_body_capped(resp.into_reader(), MAX_DOWNLOAD, url)
-                    .map_err(|e| FetchError::Transient(format!("{e:#}")));
+            Ok(resp) => match read_body_capped(resp.into_reader(), MAX_DOWNLOAD, url) {
+                Ok(bytes) => return Ok(bytes),
+                Err(BodyError::TooLong) => {
+                    return Err(FetchError::Fatal(format!(
+                        "body of {url} exceeds the {} MiB download limit",
+                        MAX_DOWNLOAD / (1024 * 1024)
+                    )));
+                }
+                Err(BodyError::Io(e)) => {
+                    last = Some(FetchError::Transient(format!("GET {url}: body read: {e}")));
+                }
+            },
+            // A definitive miss: the one status that may trigger a
+            // fallback to another candidate.
+            Err(ureq::Error::Status(404, _)) => {
+                return Err(FetchError::NotFound(format!("GET {url} failed: HTTP 404")));
             }
-            // Permanent client errors are not worth retrying; 429 and 5xx are.
+            // Other client errors (401/403/…) are permanent: no retry,
+            // no fallback.
             Err(ureq::Error::Status(code, _)) if (400..500).contains(&code) && code != 429 => {
-                return Err(FetchError::NotFound(format!(
-                    "GET {url} failed: HTTP {code}"
-                )));
+                return Err(FetchError::Fatal(format!("GET {url} failed: HTTP {code}")));
             }
             Err(e) => {
                 last = Some(FetchError::Transient(format!("GET {url}: {e}")));
@@ -651,16 +684,50 @@ enum Materialized {
     Tarball(Vec<u8>),
 }
 
-/// Locate a subpath inside an extracted archive. The common case is the
-/// GitHub layout `repo-ref/{subpath}` under the single wrapper
-/// directory, so the direct path below the archive root is tried first;
-/// a recursive search is the fallback for archives that nest deeper.
-fn locate_subdir(tmp: &Path, sub: &str) -> Option<PathBuf> {
-    let direct = archive_root(tmp).join(sub);
-    if direct.is_dir() {
-        return Some(direct);
+/// The chain of candidate roots inside an extracted archive: the
+/// extraction directory itself plus each directory along a chain of
+/// single subdirectories (up to three levels, the GitHub `repo-ref/`
+/// wrapper and the repository's own single-child prefixes).
+fn archive_chain(tmp: &Path) -> Vec<PathBuf> {
+    let mut chain = vec![tmp.to_path_buf()];
+    let mut cur = tmp.to_path_buf();
+    for _ in 0..3 {
+        let Ok(entries) = fs::read_dir(&cur) else {
+            break;
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        if entries.len() == 1 && entries[0].file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            cur = entries.remove(0).path();
+            chain.push(cur.clone());
+        } else {
+            break;
+        }
     }
-    find_dir(tmp, sub).or_else(|| find_dir(&archive_root(tmp), sub))
+    chain
+}
+
+/// Locate a subpath inside an extracted archive: try the full relative
+/// path from every candidate root on the single-subdirectory chain
+/// first, then a recursive search as the fallback for archives that
+/// nest deeper. This keeps a `repo-HEAD/` wrapper transparent without
+/// swallowing the repository's own single-child directories.
+fn locate_subdir(tmp: &Path, sub: &str) -> Option<PathBuf> {
+    let chain = archive_chain(tmp);
+    for root in &chain {
+        let direct = root.join(sub);
+        if direct.is_dir() {
+            return Some(direct);
+        }
+    }
+    chain.iter().find_map(|root| find_dir(root, sub))
+}
+
+/// Find a relative directory below one of the candidate roots of an
+/// extracted archive (see [`archive_chain`]).
+fn find_in_chain(tmp: &Path, rel: &str) -> Option<PathBuf> {
+    archive_chain(tmp)
+        .iter()
+        .find_map(|root| find_dir(root, rel))
 }
 
 /// Resolve a [`Source`] into bytes or a directory.
@@ -844,9 +911,8 @@ fn materialize_registry(
                 ))?;
                 let tmp = temp_dir()?;
                 extract_tarball(&bytes, &tmp, None)?;
-                let root = archive_root(&tmp);
-                let pkg_base = find_dir(&root, &format!("packages/{namespace}/{name}"))
-                    .or_else(|| find_dir(&root, &format!("packages/{name}")))
+                let pkg_base = find_in_chain(&tmp, &format!("packages/{namespace}/{name}"))
+                    .or_else(|| find_in_chain(&tmp, &format!("packages/{name}")))
                     .ok_or_else(|| {
                         anyhow!("package `{namespace}/{name}` not found in registry `{url}`")
                     })?;
@@ -1210,8 +1276,12 @@ mod json {
             if self.i + 4 > self.b.len() {
                 return Err("truncated \\u escape".to_string());
             }
-            let s = std::str::from_utf8(&self.b[self.i..self.i + 4])
-                .map_err(|_| "bad \\u escape".to_string())?;
+            let hex = &self.b[self.i..self.i + 4];
+            if !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+                return Err("bad \\u escape: not four hex digits".to_string());
+            }
+            // Safe: four ASCII hex digits only (no sign, no whitespace).
+            let s = std::str::from_utf8(hex).map_err(|_| "bad \\u escape".to_string())?;
             let v = u32::from_str_radix(s, 16).map_err(|_| "bad \\u escape".to_string())?;
             self.i += 4;
             Ok(v)
@@ -1222,11 +1292,21 @@ mod json {
             if self.peek() == Some(b'-') {
                 self.i += 1;
             }
-            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
-                self.i += 1;
+            // JSON numbers: `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`
+            match self.peek() {
+                Some(b'0') => self.i += 1,
+                Some(c) if c.is_ascii_digit() => {
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                        self.i += 1;
+                    }
+                }
+                _ => return Err("invalid number".to_string()),
             }
             if self.peek() == Some(b'.') {
                 self.i += 1;
+                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    return Err("invalid number: no digit after '.'".to_string());
+                }
                 while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                     self.i += 1;
                 }
@@ -1235,6 +1315,9 @@ mod json {
                 self.i += 1;
                 if matches!(self.peek(), Some(b'+' | b'-')) {
                     self.i += 1;
+                }
+                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    return Err("invalid number: no digit in exponent".to_string());
                 }
                 while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                     self.i += 1;
@@ -1297,44 +1380,76 @@ struct TarEntry {
 }
 
 /// Read the `path` record out of a PAX extended header, if present.
-/// Records are parsed by their declared length (`<len> key=value\n`), as
-/// the format requires, not by scanning for separators.
+/// Records are parsed strictly by their declared length
+/// (`<len> key=value\n`, where `<len>` counts the whole record), the
+/// whole record set is validated, and malformed input is an error —
+/// never a panic and never a guess.
 fn pax_path(data: &[u8]) -> Result<Option<String>> {
-    let mut pos = 0;
+    let mut pos = 0usize;
+    let mut found: Option<String> = None;
     while pos < data.len() {
-        let Some(sp) = data[pos..].iter().position(|&b| b == b' ') else {
-            bail!("malformed PAX record: no length separator");
-        };
-        let len_str = std::str::from_utf8(&data[pos..pos + sp])
+        let rel_sp = data[pos..]
+            .iter()
+            .position(|&b| b == b' ')
+            .ok_or_else(|| anyhow!("malformed PAX record: no length separator"))?;
+        let len_str = std::str::from_utf8(&data[pos..pos + rel_sp])
             .map_err(|_| anyhow!("malformed PAX record: length is not ASCII"))?;
         let len: usize = len_str
             .parse()
             .map_err(|_| anyhow!("malformed PAX record: bad length `{len_str}`"))?;
-        if len == 0 || pos + len > data.len() {
+        // The declared length covers `<len>` + space + body + newline, so
+        // it must be at least large enough for the prefix and terminator.
+        if len < rel_sp + 2 || pos + len > data.len() {
             bail!("malformed PAX record: length {len} out of bounds");
         }
         let record = &data[pos..pos + len];
-        let prefix_len = sp - pos + 1; // "<len> "
-        pos += len;
-        // The record body after the `<len> ` prefix is `key=value\n`.
-        let body = &record[prefix_len..];
-        let body = body.strip_suffix(b"\n").unwrap_or(body);
+        if record[len - 1] != b'\n' {
+            bail!("malformed PAX record: does not end with a newline");
+        }
+        // The record body after the `<len> ` prefix is `key=value`.
+        let body = &record[rel_sp + 1..len - 1];
         let Some(eq) = body.iter().position(|&b| b == b'=') else {
             bail!("malformed PAX record: no '=' separator");
         };
-        if &body[..eq] == b"path" {
-            return decode_path(&body[eq + 1..]).map(Some);
+        if &body[..eq] == b"path" && found.is_none() {
+            found = Some(decode_path(&body[eq + 1..])?);
         }
+        pos += len;
     }
-    Ok(None)
+    Ok(found)
+}
+
+/// Resource budgets for decoding one archive, parameterized so tests can
+/// exercise the accumulation logic at small scales.
+#[derive(Clone, Copy)]
+struct TarLimits {
+    max_entries: usize,
+    max_total: u64,
+    max_member: u64,
+    max_trailer: u64,
+}
+
+/// The production budgets: 50k members, 1 GiB total unpacked, 512 MiB
+/// per member, 64 MiB of trailer after the end-of-archive marker.
+const PRODUCTION_LIMITS: TarLimits = TarLimits {
+    max_entries: MAX_ARCHIVE_ENTRIES,
+    max_total: MAX_TOTAL_UNPACKED,
+    max_member: MAX_MEMBER_SIZE,
+    max_trailer: MAX_TRAILER,
+};
+
+/// Decode a gzipped tarball into entries under the production budgets.
+fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
+    decode_tar_with(gz, &PRODUCTION_LIMITS)
 }
 
 /// Decode a gzipped tarball into entries. Untrusted input: the gzip
 /// stream must decode cleanly (including trailing garbage, which is an
-/// error), the header checksum is verified, short reads are errors, an
-/// end-of-archive marker is required, resource budgets (including
-/// metadata headers) are enforced, and non-regular members are rejected.
-fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
+/// error), the header checksum is verified, short reads are errors, the
+/// two-block end-of-archive marker is required, resource budgets
+/// (including metadata headers) are enforced, and non-regular members
+/// are rejected.
+fn decode_tar_with(gz: &[u8], limits: &TarLimits) -> Result<Vec<TarEntry>> {
     let mut reader = MultiGzDecoder::new(gz);
     let mut entries = Vec::new();
     let mut total: u64 = 0;
@@ -1361,18 +1476,28 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
             bail!("truncated tar header");
         }
         members_seen += 1;
-        if members_seen > MAX_ARCHIVE_ENTRIES {
-            bail!("archive has too many entries (limit {MAX_ARCHIVE_ENTRIES})");
+        if members_seen > limits.max_entries {
+            bail!(
+                "archive has too many entries (limit {})",
+                limits.max_entries
+            );
         }
         if header.iter().all(|&b| b == 0) {
-            // End-of-archive marker: what follows must be zero padding
-            // only, within a bounded read.
+            // First end-of-archive block: tar requires a second one,
+            // then only zero padding within a bounded read.
+            let mut second = [0u8; 512];
+            reader
+                .read_exact(&mut second)
+                .context("truncated end-of-archive marker")?;
+            if !second.iter().all(|&b| b == 0) {
+                bail!("end-of-archive marker is not followed by a second zero block");
+            }
             let mut rest = Vec::new();
             (&mut reader)
-                .take(MAX_TRAILER + 1)
+                .take(limits.max_trailer + 1)
                 .read_to_end(&mut rest)
                 .context("reading tar trailer")?;
-            if rest.len() as u64 > MAX_TRAILER {
+            if rest.len() as u64 > limits.max_trailer {
                 bail!("excessive data after end-of-archive marker");
             }
             if rest.iter().any(|&b| b != 0) {
@@ -1393,25 +1518,35 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
             bail!("tar header checksum mismatch (stored {stored:o}, computed {sum:o})");
         }
         let size = octal(&header[124..136])?;
-        if size > MAX_MEMBER_SIZE {
+        if size > limits.max_member {
             bail!(
                 "tar member of {size} bytes exceeds the {} MiB member limit",
-                MAX_MEMBER_SIZE / (1024 * 1024)
+                limits.max_member / (1024 * 1024)
             );
         }
-        if total + size > MAX_TOTAL_UNPACKED {
+        // Every member — file, directory or metadata header — counts
+        // against the total unpacked budget.
+        if total + size > limits.max_total {
             bail!(
                 "archive exceeds the total unpacked limit of {} MiB",
-                MAX_TOTAL_UNPACKED / (1024 * 1024)
+                limits.max_total / (1024 * 1024)
             );
         }
+        total += size;
         let mut name = {
-            let n = decode_path(nul_terminated(&header[..100]))?;
+            // The fallback name in a GNU long-name pair may be a
+            // byte-truncated placeholder; when a long name is pending it
+            // wins anyway, so tolerate an undecodable header name there.
+            let n = match decode_path(nul_terminated(&header[..100])) {
+                Ok(n) => Some(n),
+                Err(e) if pending_long_name.is_some() => None,
+                Err(e) => return Err(e),
+            };
             let prefix = decode_path(nul_terminated(&header[345..500]))?;
-            if prefix.is_empty() {
-                n
-            } else {
-                format!("{prefix}/{n}")
+            match n {
+                Some(n) if prefix.is_empty() => n,
+                Some(n) => format!("{prefix}/{n}"),
+                None => String::new(),
             }
         };
         let mut data = vec![0u8; size as usize];
@@ -1428,19 +1563,16 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
         let typeflag = header[156];
         match typeflag {
             b'L' => {
-                total += size;
                 pending_long_name = Some(decode_path(nul_terminated(&data))?);
                 continue;
             }
             b'x' => {
-                total += size;
                 pending_pax_path = pax_path(&data)?;
                 continue;
             }
             b'g' => {
                 // A global PAX header replaces any pending extended
                 // attributes rather than extending them.
-                total += size;
                 pending_pax_path = None;
                 pending_long_name = None;
                 continue;
@@ -1448,7 +1580,6 @@ fn decode_tar(gz: &[u8]) -> Result<Vec<TarEntry>> {
             b'K' => {
                 // GNU long-link-name header: the member it names will be
                 // rejected as a link anyway.
-                total += size;
                 continue;
             }
             b'1' | b'2' => {
@@ -1498,8 +1629,13 @@ const WINDOWS_RESERVED: [&str; 22] = [
 /// Validate an archive member path: it must be relative, slash-separated
 /// UTF-8 text that stays inside the destination and can exist on every
 /// supported filesystem — no drive letters or NTFS streams (colons), no
-/// reserved device names, no trailing dots or spaces.
+/// reserved device names, no trailing dots or spaces. A single trailing
+/// slash (the conventional directory entry spelling) is tolerated.
 fn safe_member_path(path: &str) -> Result<String> {
+    // Directory entries conventionally end in `/`; drop that one slash
+    // before the component checks (internal empty components stay
+    // rejected).
+    let path = path.strip_suffix('/').unwrap_or(path);
     if path.is_empty() {
         bail!("empty archive member path");
     }
@@ -1646,9 +1782,16 @@ impl TarWriter {
             None => {
                 // Not splittable into ustar fields: emit a GNU long-name
                 // entry carrying the real name, then the member header.
+                // The fallback header name is a placeholder; cut it at a
+                // UTF-8 character boundary so the reader (which ignores
+                // it in favour of the long name) never sees broken text.
                 self.write_long_name(&name)?;
                 let nb = name.as_bytes();
-                header[..nb.len().min(100)].copy_from_slice(&nb[..nb.len().min(100)]);
+                let mut cut = nb.len().min(100);
+                while cut > 0 && (nb[cut] & 0xC0) == 0x80 {
+                    cut -= 1;
+                }
+                header[..cut].copy_from_slice(&nb[..cut]);
             }
         }
         self.finish_header(&mut header, if is_dir { b'5' } else { b'0' }, data.len())?;
@@ -1809,26 +1952,6 @@ fn find_pack_root(tmp: &Path) -> Result<PathBuf> {
     Ok(tmp.to_path_buf())
 }
 
-/// Walk down the chain of single subdirectories (up to three levels)
-/// from an extracted archive to its inner root — the GitHub `repo-ref/`
-/// wrapper in the common case. Unlike [`find_pack_root`] this does not
-/// look at manifests: it is for locating known paths inside the archive.
-fn archive_root(tmp: &Path) -> PathBuf {
-    let mut cur = tmp.to_path_buf();
-    for _ in 0..3 {
-        let Ok(entries) = fs::read_dir(&cur) else {
-            break;
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        if entries.len() == 1 && entries[0].file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            cur = entries.remove(0).path();
-        } else {
-            break;
-        }
-    }
-    cur
-}
-
 /// Create (if missing) a GitHub release and upload `bytes` as an asset.
 /// Requires a token in `GITHUB_TOKEN` (or `TYPSHIP_TOKEN`).
 fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -> Result<()> {
@@ -1923,26 +2046,31 @@ fn percent_encode(s: &str) -> String {
 
 /// Link a named pack from `src` to `dst` instead of copying.
 ///
-/// Both ends must be linkable: a filesystem or local-namespace directory.
-/// Any other shape is rejected with a clear error.
+/// When both ends are linkable (a filesystem or local-namespace
+/// directory on the source side, a directory on the destination side) a
+/// link is created; any other shape falls back to [`copy`], per the
+/// command's contract that `link` establishes links when both ends are
+/// linkable and otherwise copies.
 pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     let source = parse_source(src)?;
     let dest = parse_dest(dst)?;
-    let src_dir = match &source {
+    let linkable_src = match &source {
         Source::Fs(p) => {
             if !p.is_dir() {
                 bail!("fs pack `{}` is not a directory", p.display());
             }
-            p.clone()
+            true
         }
-        Source::Tarball(_) => {
-            bail!("a tarball pack cannot be linked; use `copy` instead")
-        }
-        Source::Registry {
-            namespace,
-            name,
-            version,
-        } if namespace == "local" => {
+        Source::Registry { namespace, .. } if namespace == "local" => true,
+        _ => false,
+    };
+    if !linkable_src || !matches!(dest, Dest::Dir(_)) {
+        // Not linkable on both ends: the command degrades to a copy.
+        return copy(src, dst, registry);
+    }
+    let src_dir = match &source {
+        Source::Fs(p) => p.clone(),
+        Source::Registry { name, version, .. } => {
             let base = typst_packages_dir()?.join("local").join(name);
             let version = match version.as_deref() {
                 Some(v) => v.to_string(),
@@ -1959,22 +2087,11 @@ pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
             }
             dir
         }
-        Source::Registry { namespace, .. } => bail!(
-            "cannot link registry pack in namespace `{namespace}`: only fs and @local packs are linkable, use copy instead"
-        ),
-        Source::Stdin => {
-            bail!("cannot link stdin: only fs and @local packs are linkable, use copy instead")
-        }
-        Source::Url { .. } | Source::GithubTree { .. } | Source::GithubRelease { .. } => bail!(
-            "cannot link a remote pack: only fs and @local packs are linkable, use copy instead"
-        ),
+        _ => unreachable!("checked linkable above"),
     };
     let dst_path = match dest {
         Dest::Dir(p) => p,
-        Dest::Tarball(_) => {
-            bail!("cannot link into a tarball: only directories are linkable, use copy instead")
-        }
-        Dest::Release { .. } => bail!("cannot link into a GitHub release: use copy instead"),
+        _ => unreachable!("checked linkable above"),
     };
     let _ = registry;
     ensure_distinct(&src_dir, &dst_path)?;
@@ -2197,6 +2314,7 @@ mod tests {
         let mut raw = Vec::new();
         raw.extend_from_slice(&raw_header(b"\xff\xfe.txt", b'0', 1));
         raw.extend_from_slice(b"x");
+        raw.extend_from_slice(&[0u8; 1024]);
         let gz = gz_of_raw(&raw);
         let dest = std::env::temp_dir().join(format!("typship-nu-{}", std::process::id()));
         fs::create_dir_all(&dest).unwrap();
@@ -2237,7 +2355,7 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         assert!(extract_tarball(&gz, &dest, None).is_err());
         // A symlink member is rejected outright.
-        gz = gz_of_raw(&raw_header(b"link", b'2', 0));
+        gz = gz_of_raw(&[raw_header(b"link", b'2', 0).to_vec(), vec![0u8; 1024]].concat());
         assert!(extract_tarball(&gz, &dest, None).is_err());
         let _ = fs::remove_dir_all(&dest);
     }
@@ -2298,14 +2416,17 @@ mod tests {
         // tag-like value, plus a decoy `n path=evil` text line inside
         // another record that must not win.
         let payload = b"22 path=real/name.typ\n13 y=x path=\n";
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&raw_header(b"PaxHeader", b'x', payload.len()));
-        raw.extend_from_slice(payload);
         let pad = (512 - (payload.len() % 512)) % 512;
-        raw.extend_from_slice(&vec![0u8; pad]);
-        raw.extend_from_slice(&raw_header(b"ignored", b'0', 0));
-        raw.extend_from_slice(&[0u8; 1024]);
-        let gz = gz_of_raw(&raw);
+        let gz = gz_of_raw(
+            &[
+                raw_header(b"PaxHeader", b'x', payload.len()).to_vec(),
+                payload.to_vec(),
+                vec![0u8; pad],
+                raw_header(b"ignored", b'0', 0).to_vec(),
+                vec![0u8; 1024],
+            ]
+            .concat(),
+        );
         let entries = decode_tar(&gz).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "real/name.typ");
@@ -2471,6 +2592,273 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn writer_output_roundtrips_through_reader() {
+        // The writer's own directory entries (trailing `/`) must be
+        // accepted by the reader (R3-1 regression).
+        let base = std::env::temp_dir().join(format!("typship-wr-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("src");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("typst.toml"), "m").unwrap();
+        fs::write(src.join("inner/lib.typ"), "x").unwrap();
+        let gz = pack_tarball(&src).unwrap();
+        let dst = base.join("out");
+        extract_tarball(&gz, &dst, None).unwrap();
+        assert!(dst.join("typst.toml").is_file());
+        assert!(dst.join("inner/lib.typ").is_file());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn roundtrip_preserves_structure() {
+        let base = std::env::temp_dir().join(format!("typship-r-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+
+        // 1. A pack with a manifest: contents land at the destination top.
+        let src = base.join("a");
+        fs::create_dir_all(src.join("src")).unwrap();
+        fs::write(src.join("typst.toml"), "manifest").unwrap();
+        fs::write(src.join("src/main.typ"), "#set page()").unwrap();
+        let gz = pack_tarball(&src).unwrap();
+        let dst = base.join("b1");
+        extract_tarball(&gz, &base.join("t1"), None).unwrap();
+        let root = find_pack_root(&base.join("t1")).unwrap();
+        copy_tree(&root, &dst).unwrap();
+        assert!(dst.join("typst.toml").is_file());
+        assert!(dst.join("src/main.typ").is_file());
+
+        // 2. A directory without a manifest keeps its structure exactly.
+        let src = base.join("c");
+        fs::create_dir_all(src.join("src")).unwrap();
+        fs::write(src.join("src/main.typ"), "x").unwrap();
+        let gz = pack_tarball(&src).unwrap();
+        let dst = base.join("b2");
+        extract_tarball(&gz, &base.join("t2"), None).unwrap();
+        let root = find_pack_root(&base.join("t2")).unwrap();
+        copy_tree(&root, &dst).unwrap();
+        assert!(dst.join("src/main.typ").is_file());
+        assert!(!dst.join("main.typ").is_file());
+
+        // 3. A wrapper archive: the manifest marks the pack root.
+        let wrapped = base.join("w");
+        fs::create_dir_all(wrapped.join("repo").join("src")).unwrap();
+        fs::write(wrapped.join("repo").join("typst.toml"), "m").unwrap();
+        fs::write(wrapped.join("repo").join("src/lib.typ"), "z").unwrap();
+        let gz = pack_tarball(&wrapped).unwrap();
+        let dst = base.join("b4");
+        extract_tarball(&gz, &base.join("t4"), None).unwrap();
+        let root = find_pack_root(&base.join("t4")).unwrap();
+        copy_tree(&root, &dst).unwrap();
+        assert!(dst.join("typst.toml").is_file());
+        assert!(dst.join("src/lib.typ").is_file());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn utf8_and_long_names_survive_the_roundtrip() {
+        let base = std::env::temp_dir().join(format!("typship-u-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("中文.typ"), "hello").unwrap();
+        // Long enough to take the GNU long-name path, and multi-byte so
+        // a byte-truncated fallback header would break decoding.
+        let long = format!("{}.typ", "中".repeat(40));
+        fs::write(src.join(&long), "long").unwrap();
+        let gz = pack_tarball(&src).unwrap();
+        let dst = base.join("b");
+        extract_tarball(&gz, &dst, None).unwrap();
+        assert_eq!(fs::read(dst.join("中文.typ")).unwrap(), b"hello");
+        assert_eq!(fs::read(dst.join(&long)).unwrap(), b"long");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn pax_malformed_records_are_errors_not_panics() {
+        // A declared length smaller than its own prefix: refused.
+        let payload = b"1 path=x\n";
+        let gz = gz_of_raw(
+            &[
+                raw_header(b"p", b'x', payload.len()).to_vec(),
+                payload.to_vec(),
+                vec![0u8; (512 - (payload.len() % 512)) % 512],
+                raw_header(b"m", b'0', 0).to_vec(),
+                vec![0u8; 1024],
+            ]
+            .concat(),
+        );
+        assert!(decode_tar(&gz).is_err());
+        // A valid first record followed by a malformed one: refused (the
+        // whole record set is validated).
+        let payload = b"12 path=ok.typ\n3 junk\n";
+        let gz = gz_of_raw(
+            &[
+                raw_header(b"p", b'x', payload.len()).to_vec(),
+                payload.to_vec(),
+                vec![0u8; (512 - (payload.len() % 512)) % 512],
+                raw_header(b"m", b'0', 0).to_vec(),
+                vec![0u8; 1024],
+            ]
+            .concat(),
+        );
+        assert!(decode_tar(&gz).is_err());
+        // A record without a newline terminator: refused.
+        let payload = b"13 path=no-term";
+        let gz = gz_of_raw(
+            &[
+                raw_header(b"p", b'x', payload.len()).to_vec(),
+                payload.to_vec(),
+                vec![0u8; (512 - (payload.len() % 512)) % 512],
+                raw_header(b"m", b'0', 0).to_vec(),
+                vec![0u8; 1024],
+            ]
+            .concat(),
+        );
+        assert!(decode_tar(&gz).is_err());
+        // Multi-record with the path record second still resolves.
+        let payload = b"13 mtime=0.5\n17 path=real.typ\n";
+        let gz = gz_of_raw(
+            &[
+                raw_header(b"p", b'x', payload.len()).to_vec(),
+                payload.to_vec(),
+                vec![0u8; (512 - (payload.len() % 512)) % 512],
+                raw_header(b"m", b'0', 0).to_vec(),
+                vec![0u8; 1024],
+            ]
+            .concat(),
+        );
+        let entries = decode_tar(&gz).unwrap();
+        assert_eq!(entries[0].path, "real.typ");
+    }
+
+    #[test]
+    fn total_unpack_budget_accumulates_regular_files() {
+        let limits = TarLimits {
+            max_entries: 100,
+            max_total: 600,
+            max_member: 10_000,
+            max_trailer: 1024 * 1024,
+        };
+        // Three 300-byte files: 900 total, over the 600-byte budget.
+        let mut raw = Vec::new();
+        for i in 0..3 {
+            raw.extend_from_slice(&raw_header(format!("f{i}.txt").as_bytes(), b'0', 300));
+            raw.extend_from_slice(&vec![b'a'; 300]);
+            raw.extend_from_slice(&vec![0u8; 512 - 300]);
+        }
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        assert!(decode_tar_with(&gz, &limits).is_err(), "over budget");
+        // Two files fit under the budget.
+        let mut raw = Vec::new();
+        for i in 0..2 {
+            raw.extend_from_slice(&raw_header(format!("f{i}.txt").as_bytes(), b'0', 300));
+            raw.extend_from_slice(&vec![b'a'; 300]);
+            raw.extend_from_slice(&vec![0u8; 512 - 300]);
+        }
+        raw.extend_from_slice(&[0u8; 1024]);
+        let gz = gz_of_raw(&raw);
+        assert!(decode_tar_with(&gz, &limits).is_ok(), "within budget");
+    }
+
+    #[test]
+    fn single_zero_block_is_not_a_complete_end_marker() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&raw_header(b"a.txt", b'0', 1));
+        raw.extend_from_slice(b"x");
+        raw.extend_from_slice(&vec![0u8; 511]);
+        raw.extend_from_slice(&[0u8; 512]); // only one of the two blocks
+        let gz = gz_of_raw(&raw);
+        let dest = std::env::temp_dir().join(format!("typship-z1-{}", std::process::id()));
+        fs::create_dir_all(&dest).unwrap();
+        assert!(extract_tarball(&gz, &dest, None).is_err());
+        let _ = fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn http_403_is_permanent_and_never_retried() {
+        let (url, count) = mock_server(&[(403, "forbidden")]);
+        match get_bytes(&format!("{url}/private")) {
+            Err(FetchError::Fatal(_)) => {}
+            other => panic!("expected Fatal, got {other:?}"),
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn truncated_body_is_retried_until_success() {
+        // Response declares 20 bytes but delivers 2 and closes: the body
+        // read fails, which is transient, so a second request follows.
+        let truncated: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nok";
+        let full: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let (url, count) = mock_raw_server(&[truncated, full]);
+        let body = fetch_bytes(&format!("{url}/f")).unwrap();
+        assert_eq!(body, b"ok".to_vec());
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn locate_subdir_crosses_wrapper_and_single_chain() {
+        // A GitHub wrapper followed by the repository's own single-child
+        // directory: the full subpath must resolve (R3-4 regression).
+        let base = std::env::temp_dir().join(format!("typship-ls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let sub = base.join("repo-HEAD").join("sub");
+        fs::create_dir_all(sub.join("inner")).unwrap();
+        fs::write(sub.join("lib.typ"), "x").unwrap();
+        assert!(locate_subdir(&base, "sub").is_some());
+        assert!(locate_subdir(&base, "sub/inner").is_some());
+        // A registry-style nested path below the wrapper.
+        let pkg = base
+            .join("repo-HEAD")
+            .join("packages")
+            .join("preview")
+            .join("name");
+        fs::create_dir_all(&pkg).unwrap();
+        assert!(find_in_chain(&base, "packages/preview/name").is_some());
+        assert!(find_in_chain(&base, "packages/absent").is_none());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn json_lexer_rejects_malformed_numbers_and_escapes() {
+        assert!(json::parse("01").is_err(), "leading zero");
+        assert!(json::parse("-").is_err());
+        assert!(json::parse("1.").is_err());
+        assert!(json::parse("1e").is_err());
+        assert!(json::parse("\"\\u+041\"").is_err(), "non-hex escape");
+        assert!(json::parse("\"\\u04\"").is_err(), "short escape");
+    }
+
+    #[test]
+    fn json_parser_decodes_escaped_surrogate_pairs() {
+        let v = json::parse("{\"e\":\"\\ud83d\\ude00\"}").unwrap();
+        assert_eq!(v.get("e").unwrap().as_str(), Some("\u{1F600}"));
+    }
+
+    #[test]
+    fn link_falls_back_to_copy_when_ends_are_not_linkable() {
+        // dir -> tarball: not linkable on the destination side, so the
+        // command copies.
+        let base = std::env::temp_dir().join(format!("typship-lc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let src = base.join("a");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("f.txt"), "x").unwrap();
+        let tgz = base.join("out.tar.gz");
+        link(&src.to_string_lossy(), &tgz.to_string_lossy(), None).unwrap();
+        assert!(tgz.is_file());
+        // tarball -> dir: not linkable on the source side, so it copies
+        // (and the manifest-less tree keeps its structure).
+        let dst = base.join("out");
+        link(&tgz.to_string_lossy(), &dst.to_string_lossy(), None).unwrap();
+        assert!(dst.join("f.txt").is_file());
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// Build a gzipped tar from (path, data) pairs through the writer.
     fn gz_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut raw = Vec::new();
@@ -2519,6 +2907,30 @@ mod tests {
     /// A tiny HTTP server answering a scripted sequence of
     /// (status, body) responses (the last one repeats) and counting
     /// the requests it served.
+    /// A tiny HTTP server answering one scripted raw byte response per
+    /// connection (the last one repeats) and counting requests. Used to
+    /// simulate broken bodies (short reads) that the (status, body)
+    /// helper cannot express.
+    fn mock_raw_server(responses: &[&[u8]]) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let count2 = count.clone();
+        let responses: Vec<Vec<u8>> = responses.iter().map(|r| r.to_vec()).collect();
+        std::thread::spawn(move || {
+            for (i, stream) in listener.incoming().enumerate() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let idx = i.min(responses.len() - 1);
+                count2.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.write_all(&responses[idx]);
+                // Dropping the stream closes the connection.
+            }
+        });
+        (format!("http://{addr}"), count)
+    }
+
     fn mock_server(responses: &[(u16, &str)]) -> (String, Arc<AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
