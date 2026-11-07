@@ -572,15 +572,14 @@ fn ensure_distinct(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The per-user Typst packages directory; the well-known directory
-/// lookup is delegated to the `dirs` crate (LOCALAPPDATA on Windows,
-/// XDG_DATA_HOME or the platform default elsewhere).
+/// The per-user Typst packages directory, matching the official typst
+/// package loader's `system_data`: `dirs::data_dir()` everywhere, i.e.
+/// `%APPDATA%/typst/packages` on Windows (NOT the LOCALAPPDATA cache
+/// directory), `$XDG_DATA_HOME` or `~/.local/share` on Linux and
+/// `~/Library/Application Support` on macOS.
 fn typst_packages_dir() -> Result<PathBuf> {
-    #[cfg(target_os = "windows")]
-    let base = dirs::data_local_dir();
-    #[cfg(not(target_os = "windows"))]
-    let base = dirs::data_dir();
-    let base = base.ok_or_else(|| anyhow!("cannot determine the per-user data directory"))?;
+    let base =
+        dirs::data_dir().ok_or_else(|| anyhow!("cannot determine the per-user data directory"))?;
     Ok(base.join("typst").join("packages"))
 }
 
