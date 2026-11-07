@@ -269,6 +269,7 @@ pub fn parse_dest(s: &str) -> Result<Dest> {
 
 /// Normalize a path: resolve `.` components so external tools
 /// (e.g. `mklink`) do not misparse segments like `./name`.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn dunce_like_absolute(p: &Path) -> PathBuf {
     let text = p.to_string_lossy().to_string();
     let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
