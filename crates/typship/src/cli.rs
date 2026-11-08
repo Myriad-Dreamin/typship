@@ -1,54 +1,94 @@
-//! Hand-rolled, zero-dependency command-line parsing and subcommand dispatch.
+//! Command-line interface for typship.
+//!
+//! Declarative argument parsing and subcommand dispatch via [`palc`].
+//! Help text (`-h`/`--help` and the `help` subcommand) is rendered by
+//! `palc` itself; only `--version` is handled manually, since `palc`
+//! does not implement the `version` attribute yet.
 
 use std::ffi::OsString;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
+use palc::Parser;
 
-use crate::manifest;
+use crate::{manifest, pack};
 
-/// The usage information printed when no or an unknown command is given.
-const USAGE: &str = "typship - A simple package manager for Typst
+/// A simple package manager for Typst.
+#[derive(Debug, palc::Parser)]
+struct Cli {
+    /// Print version.
+    #[arg(short = 'V', long)]
+    version: bool,
 
-Usage: typship <COMMAND>
+    /// The subcommand to run.
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-Commands:
-  init  Initialize the current directory as a typship package
-  help  Print this message
+/// A parsed subcommand.
+#[derive(Debug, palc::Subcommand)]
+enum Command {
+    /// Initialize the current directory as a typship package.
+    Init,
+    Copy(CopyArgs),
+    Link(LinkArgs),
+    /// Print the help message.
+    Help,
+}
 
-Options:
-  -h, --help     Print help
-  -V, --version  Print version";
+/// Copy a named pack from a source to a destination.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Copy a named pack from a source to a destination.")]
+struct CopyArgs {
+    /// The source pack.
+    src: String,
+    /// The destination pack.
+    dst: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
+}
+
+/// Link a source pack to a destination instead of copying.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Link a source pack to a destination instead of copying.")]
+struct LinkArgs {
+    /// The source pack.
+    src: String,
+    /// The destination pack.
+    dst: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
+}
+
+/// Renders the top-level help message via `palc`.
+fn render_help() -> String {
+    Cli::render_long_help("typship")
+}
 
 /// Parses the given arguments and dispatches to the matching subcommand.
 pub fn dispatch(args: impl Iterator<Item = OsString>) -> Result<()> {
-    let mut args = args;
-    let _program = args.next();
-    let Some(arg) = args.next() else {
-        println!("{USAGE}");
-        return Ok(());
-    };
-
-    match arg.to_string_lossy().as_ref() {
-        "init" => {
-            if let Some(extra) = args.next() {
-                bail!(
-                    "unexpected argument `{}` for the init command\n\nUsage: typship init",
-                    extra.to_string_lossy()
-                );
-            }
-            manifest::init_current_dir()
-        }
-        "help" | "--help" | "-h" => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        "--version" | "-V" => {
+    match Cli::try_parse_from(args) {
+        Ok(cli) if cli.version => {
             println!("typship {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        other => bail!(
-            "unrecognized command `{other}`\n\nrun `typship help` for usage information"
-        ),
+        Ok(cli) => match cli.command {
+            Some(Command::Init) => manifest::init_current_dir(),
+            Some(Command::Copy(args)) => pack::copy(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Link(args)) => pack::link(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Help) | None => {
+                println!("{}", render_help());
+                Ok(())
+            }
+        },
+        Err(err) => match err.try_into_help() {
+            Ok(help) => {
+                println!("{help}");
+                Ok(())
+            }
+            Err(err) => Err(err.into()),
+        },
     }
 }
 
@@ -61,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_prints_usage() {
+    fn no_arguments_prints_help() {
         assert!(dispatch_str(&["typship"]).is_ok());
     }
 
@@ -73,7 +113,17 @@ mod tests {
     }
 
     #[test]
+    fn help_is_rendered_by_palc() {
+        let help = render_help();
+        assert!(help.contains("Usage: typship"), "{help}");
+        assert!(help.contains("init"), "{help}");
+        assert!(help.contains("--version"), "{help}");
+    }
+
+    #[test]
     fn unknown_command_is_rejected() {
+        let err = Cli::try_parse_from(["typship", "frobnicate"]).unwrap_err();
+        assert!(err.to_string().contains("frobnicate"), "{err}");
         assert!(dispatch_str(&["typship", "frobnicate"]).is_err());
     }
 

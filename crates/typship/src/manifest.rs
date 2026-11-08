@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// The file name of the typst package manifest.
 const MANIFEST_FILE: &str = "typst.toml";
@@ -38,10 +38,7 @@ fn init_dir(dir: &Path, name: &str) -> Result<()> {
         .next()
         .is_some()
     {
-        bail!(
-            "refusing to initialize: {} is not empty",
-            dir.display()
-        );
+        bail!("refusing to initialize: {} is not empty", dir.display());
     }
 
     let manifest = dir.join(MANIFEST_FILE);
@@ -63,27 +60,31 @@ fn init_dir(dir: &Path, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Formats the manifest TOML for a package with the given name and version.
-fn manifest_toml(name: &str, version: &str) -> String {
-    format!(
-        "[package]\nname = \"{}\"\nversion = \"{version}\"\nentrypoints = [\"{ENTRYPOINT}\"]\n",
-        escape_toml_string(name),
-    )
+/// The `[package]` table of a generated `typst.toml` manifest; string
+/// escaping is delegated to the `toml` crate during serialization.
+#[derive(serde::Serialize)]
+struct PackageManifest<'a> {
+    name: &'a str,
+    version: &'a str,
+    entrypoints: [&'a str; 1],
 }
 
-/// Escapes a string for use inside a basic TOML string literal.
-fn escape_toml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out
+/// The whole generated `typst.toml` document.
+#[derive(serde::Serialize)]
+struct ManifestDocument<'a> {
+    package: PackageManifest<'a>,
+}
+
+/// Formats the manifest TOML for a package with the given name and version.
+fn manifest_toml(name: &str, version: &str) -> String {
+    toml::to_string(&ManifestDocument {
+        package: PackageManifest {
+            name,
+            version,
+            entrypoints: [ENTRYPOINT],
+        },
+    })
+    .expect("manifest serialization cannot fail")
 }
 
 /// Formats the content of the generated root entrypoint.
@@ -97,16 +98,29 @@ mod tests {
 
     #[test]
     fn manifest_contains_expected_fields() {
-        let toml = manifest_toml("example", "0.1.0");
+        let doc = manifest_toml("example", "0.1.0");
         assert_eq!(
-            toml,
+            doc,
             "[package]\nname = \"example\"\nversion = \"0.1.0\"\nentrypoints = [\"lib.typ\"]\n"
         );
     }
 
     #[test]
     fn manifest_escapes_special_characters() {
-        let toml = manifest_toml("ex\"a\\mple", "0.1.0");
-        assert!(toml.contains("name = \"ex\\\"a\\\\mple\""));
+        let doc = manifest_toml("ex\"a\\mple", "0.1.0");
+        // Round-trip through the crate parser: the name must come back
+        // verbatim whatever escape style the serializer picked.
+        let parsed: toml::Table = toml::from_str(&doc).unwrap();
+        assert_eq!(parsed["package"]["name"].as_str(), Some("ex\"a\\mple"));
+    }
+
+    #[test]
+    fn manifest_escapes_control_characters() {
+        let doc = manifest_toml("ex\ra\x07mple", "0.1.0");
+        // Control characters must be escaped, never emitted raw (the old
+        // hand-written escaper let raw CR through, producing invalid TOML).
+        assert!(!doc.bytes().any(|b| b == b'\r' || b == 0x07));
+        let parsed: toml::Table = toml::from_str(&doc).unwrap();
+        assert_eq!(parsed["package"]["name"].as_str(), Some("ex\ra\x07mple"));
     }
 }
