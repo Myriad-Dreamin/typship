@@ -717,6 +717,7 @@ name = "typship"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "palc",
  "serde",
  "toml",

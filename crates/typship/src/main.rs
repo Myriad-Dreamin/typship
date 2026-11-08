@@ -3,6 +3,7 @@
 //! A simple package manager for Typst.
 
 mod cli;
+mod download;
 mod manifest;
 
 use anyhow::Result;
