@@ -7,13 +7,18 @@
 //! (in [`crate::manifest`]) with `toml`. No hand-written parsers or
 //! encoders for standard formats remain (admin direction 2026-11-08).
 //!
-//! Safety posture for untrusted archives: member paths are validated (no
-//! absolute paths, no `..`, no backslashes, no colons, no Windows device
-//! names, no trailing dots or spaces), member names must be UTF-8, the
-//! header checksum is verified, and a short member body is an error
-//! rather than a truncated file. Resource budgets were removed per admin
-//! direction 2026-11-08 ("不要做没必要的限制"): an archive is as large
-//! as it is. Link and device members are rejected outright.
+//! Safety posture for untrusted archives, aligned with typst's own
+//! unpacking rules: member paths are validated (no absolute paths, no
+//! `..` components), member names must be UTF-8, and member types are
+//! restricted to plain files and directories -- link and device members
+//! are rejected outright. No backslash/colon/device-name/trailing-dot
+//! rules: on unix those are ordinary characters, and the `tar` crate
+//! unpacks them the same way typst does. PAX record-level validation
+//! was removed with the same alignment (the crate silently drops
+//! malformed records). The header checksum is verified, and a short
+//! member body is an error rather than a truncated file. Resource
+//! budgets were removed per admin direction 2026-11-08 ("不要做没必
+//! 要的限制"): an archive is as large as it is.
 //!
 //! HTTP posture: only transient failures (transport errors, 429 and 5xx)
 //! are retried; other 4xx answers are a definitive miss, and a non-gzip
@@ -21,16 +26,18 @@
 //! request. Response bodies are read in full — no download cap (admin
 //! direction 2026-11-08, "不要做没必要的限制").
 
+use std::borrow::Cow;
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use walkdir::WalkDir;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Total per-request timeout; a network path must never hang forever.
@@ -183,6 +190,14 @@ pub enum Source {
         /// Optional exact version; latest is picked when absent.
         version: Option<String>,
     },
+    /// A GitHub repository root or `.git` URL: the default branch,
+    /// cloned with git.
+    GithubRepo {
+        /// Repository owner.
+        owner: String,
+        /// Repository name (without a `.git` suffix).
+        repo: String,
+    },
     /// A URL that resolves to a gzipped tarball, plus an optional
     /// in-archive subpath.
     Url {
@@ -237,9 +252,9 @@ fn is_http(s: &str) -> bool {
 }
 
 fn is_fs_path(s: &str) -> bool {
-    s.starts_with("./")
-        || s.starts_with(".\\")
-        || s.starts_with("../")
+    [".", ".."]
+        .iter()
+        .any(|p| s.starts_with(&format!("{p}/")) || s.starts_with(&format!("{p}\\")))
         || s.starts_with('/')
         || s.starts_with('\\')
         || (s.as_bytes().get(1) == Some(&b':')
@@ -311,109 +326,112 @@ pub fn parse_source(s: &str) -> Result<Source> {
     if !is_http(s) {
         bail!("`{s}` is neither a valid pack (fs path, `-`, `@ns/name`) nor an http(s) URL");
     }
-    // git pack: `.../repo.git` — no ref is expressible, so the default
-    // branch is used. Generic git hosts use different archive layouts;
-    // failing clearly beats downloading the wrong thing.
-    if let Some(base) = s.strip_suffix(".git") {
-        if let Some(rest) = base.strip_prefix("https://github.com/") {
-            let mut it = rest.splitn(2, '/');
-            let (owner, repo) = (
-                it.next()
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("invalid GitHub URL `{s}`"))?,
-                it.next()
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| anyhow!("invalid GitHub URL `{s}`"))?,
+    // git pack: `.../repo.git` -- no ref is expressible, so the default
+    // branch is cloned. Generic git hosts use different layouts; failing
+    // clearly beats downloading the wrong thing.
+    if s.ends_with(".git") {
+        let url = url::Url::parse(s).map_err(|e| anyhow!("invalid URL `{s}`: {e}"))?;
+        if url.host_str().map(|h| h.eq_ignore_ascii_case("github.com")) != Some(true) {
+            bail!(
+                "git pack support is limited to github.com URLs; for other hosts pass a direct archive URL"
             );
-            return Ok(Source::Url {
-                url: format!("https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD"),
-                subpath: None,
-            });
         }
-        bail!(
-            "git pack support is limited to github.com URLs; for other hosts pass a direct archive URL"
-        );
-    }
-    let host_and_path = s
-        .strip_prefix("https://")
-        .unwrap_or_else(|| s.strip_prefix("http://").unwrap_or(s));
-    let segs: Vec<&str> = host_and_path.split('/').collect();
-    if segs[0] == "github.com" {
-        if segs.len() < 3 || segs[1].is_empty() || segs[2].is_empty() {
+        let segs: Vec<&str> = url
+            .path_segments()
+            .map(|segs| segs.filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
+        if segs.len() != 2 {
             bail!("invalid GitHub URL `{s}`");
         }
-        let (owner, repo) = (segs[1], segs[2]);
-        // `.../archive/...` is already an archive URL: pass it through
-        // untouched so the requested ref is preserved.
-        if segs.len() >= 4 && segs[3] == "archive" {
-            return Ok(Source::Url {
-                url: s.to_string(),
-                subpath: None,
-            });
-        }
-        // GitHub release pack: releases/latest | releases/tag/{t} |
-        // releases/{t} | releases/download/{t}/{asset}.
-        if segs.len() >= 4 && segs[3] == "releases" {
-            match segs.get(4).copied() {
-                Some("download") => {
-                    // An asset download URL: use it exactly as given.
-                    if segs.len() < 6 {
-                        bail!("invalid GitHub release asset URL `{s}`");
-                    }
-                    return Ok(Source::Url {
-                        url: s.to_string(),
-                        subpath: None,
-                    });
-                }
-                Some("tag") => {
-                    // The tag may contain slashes: everything after
-                    // `tag/` is the literal tag, including a tag that
-                    // happens to be named `latest`.
-                    let tag = segs.get(5..).filter(|t| !t.is_empty()).map(|t| t.join("/"));
-                    return Ok(Source::GithubRelease {
-                        repo: format!("{owner}/{repo}"),
-                        tag,
-                    });
-                }
-                Some("latest") => {
-                    return Ok(Source::GithubRelease {
-                        repo: format!("{owner}/{repo}"),
-                        tag: None,
-                    });
-                }
-                Some(_tag) => {
-                    return Ok(Source::GithubRelease {
-                        repo: format!("{owner}/{repo}"),
-                        tag: Some(segs[4..].join("/")),
-                    });
-                }
-                None => bail!("invalid GitHub release URL `{s}`"),
-            }
-        }
-        // GitHub directory pack: tree/{ref-with-possible-slashes[/subpath]}.
-        if segs.len() >= 5 && segs[3] == "tree" {
-            return Ok(Source::GithubTree {
-                owner: owner.to_string(),
-                repo: repo.to_string(),
-                rest: segs[4..].iter().map(|s| s.to_string()).collect(),
-            });
-        }
-        if segs.len() == 3 {
-            // A plain repository URL: the default branch.
-            return Ok(Source::Url {
-                url: format!("https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD"),
-                subpath: None,
-            });
-        }
-        bail!(
-            "`{s}` is not a pack source (expected a repository root, tree, archive, release or .git URL)"
-        );
+        return Ok(Source::GithubRepo {
+            owner: segs[0].to_string(),
+            repo: segs[1].trim_end_matches(".git").to_string(),
+        });
     }
-    // Any other http(s) URL: a tarball.
-    Ok(Source::Url {
-        url: s.to_string(),
-        subpath: None,
-    })
+    let url = url::Url::parse(s).map_err(|e| anyhow!("invalid URL `{s}`: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("`{s}` is neither a valid pack (fs path, `-`, `@ns/name`) nor an http(s) URL");
+    }
+    let segs: Vec<&str> = url
+        .path_segments()
+        .map(|segs| segs.filter(|p| !p.is_empty()).collect())
+        .unwrap_or_default();
+    if url.host_str().map(|h| h.eq_ignore_ascii_case("github.com")) != Some(true) {
+        // Any other http(s) URL: a tarball.
+        return Ok(Source::Url {
+            url: s.to_string(),
+            subpath: None,
+        });
+    }
+    if segs.len() < 2 {
+        bail!("invalid GitHub URL `{s}`");
+    }
+    let (owner, repo) = (segs[0], segs[1]);
+    // `.../archive/...` is already an archive URL: pass it through
+    // untouched so the requested ref is preserved.
+    if segs.len() >= 4 && segs[2] == "archive" {
+        return Ok(Source::Url {
+            url: s.to_string(),
+            subpath: None,
+        });
+    }
+    // GitHub release pack: releases/latest | releases/tag/{t} |
+    // releases/{t} | releases/download/{t}/{asset}.
+    if segs.len() >= 4 && segs[2] == "releases" {
+        match segs.get(3).copied() {
+            Some("download") => {
+                // An asset download URL: use it exactly as given.
+                if segs.len() < 5 {
+                    bail!("invalid GitHub release asset URL `{s}`");
+                }
+                return Ok(Source::Url {
+                    url: s.to_string(),
+                    subpath: None,
+                });
+            }
+            Some("tag") => {
+                // The tag may contain slashes: everything after
+                // `tag/` is the literal tag, including a tag that
+                // happens to be named `latest`.
+                let tag = segs.get(4..).filter(|t| !t.is_empty()).map(|t| t.join("/"));
+                return Ok(Source::GithubRelease {
+                    repo: format!("{owner}/{repo}"),
+                    tag,
+                });
+            }
+            Some("latest") => {
+                return Ok(Source::GithubRelease {
+                    repo: format!("{owner}/{repo}"),
+                    tag: None,
+                });
+            }
+            Some(_tag) => {
+                return Ok(Source::GithubRelease {
+                    repo: format!("{owner}/{repo}"),
+                    tag: Some(segs[3..].join("/")),
+                });
+            }
+            None => bail!("invalid GitHub release URL `{s}`"),
+        }
+    }
+    // GitHub directory pack: tree/{ref-with-possible-slashes[/subpath]}.
+    if segs.len() >= 4 && segs[2] == "tree" {
+        return Ok(Source::GithubTree {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            rest: segs[3..].iter().map(|s| s.to_string()).collect(),
+        });
+    }
+    if segs.len() == 2 {
+        // A plain repository URL: the default branch, cloned with git.
+        return Ok(Source::GithubRepo {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+        });
+    }
+    bail!(
+        "`{s}` is not a pack source (expected a repository root, tree, archive, release or .git URL)"
+    )
 }
 
 /// Auto-detect a destination pack by shape.
@@ -451,8 +469,8 @@ pub fn parse_dest(s: &str) -> Result<Dest> {
 }
 
 /// Make `p` absolute (against the current directory when needed) and
-/// lexically normal; on Windows also strips `\\?\` verbatim prefixes.
-fn normalize_absolute(p: &Path) -> PathBuf {
+/// lexically cleaned, via the path-clean crate.
+fn absolute_lexical(p: &Path) -> PathBuf {
     let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -460,85 +478,75 @@ fn normalize_absolute(p: &Path) -> PathBuf {
             .map(|c| c.join(p))
             .unwrap_or_else(|_| p.to_path_buf())
     };
-    let text = abs.to_string_lossy().to_string();
-    let text = strip_verbatim(text);
-    Path::new(&text)
-        .components()
-        .filter(|c| !matches!(c, Component::CurDir))
-        .collect()
-}
-
-/// Strip `\\?\` / `\\?\UNC\` verbatim prefixes (Windows only). The UNC
-/// form keeps two leading backslashes: `\\?\UNC\server\share` is
-/// `\\server\share`.
-#[cfg(target_os = "windows")]
-fn strip_verbatim(text: String) -> String {
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{rest}")
-    } else if let Some(rest) = text.strip_prefix("\\\\?\\") {
-        rest.to_string()
-    } else {
-        text
-    }
-}
-
-/// Identity outside Windows.
-#[cfg(not(target_os = "windows"))]
-fn strip_verbatim(text: String) -> String {
-    text
+    path_clean::clean(&abs)
 }
 
 /// The physical path of `p` as far as the filesystem can tell: the
 /// longest existing ancestor is canonicalized (resolving symlinks,
-/// junctions and case differences) and the remaining suffix joined back
-/// on. Non-existing tails keep their lexical form.
+/// junctions and case differences; the `dunce` crate keeps Windows
+/// paths non-verbatim) and the remaining suffix joined back on.
+/// Non-existing tails keep their lexically cleaned form.
 fn physical(p: &Path) -> PathBuf {
-    let norm = normalize_absolute(p);
-    let mut ancestor = norm.as_path();
+    let abs = absolute_lexical(p);
+    let mut ancestor = abs.as_path();
     let mut suffix: Vec<std::ffi::OsString> = Vec::new();
     loop {
-        match ancestor.canonicalize() {
+        match dunce::canonicalize(ancestor) {
             Ok(real) => {
                 let mut out: PathBuf = real;
                 for part in suffix.iter().rev() {
                     out.push(part);
                 }
-                return normalize_absolute(&out);
+                return out;
             }
             Err(_) => match (ancestor.parent(), ancestor.file_name()) {
                 (Some(parent), Some(last)) => {
                     suffix.push(last.to_os_string());
                     ancestor = parent;
                 }
-                _ => return normalize_absolute(p),
+                _ => return abs,
             },
         }
     }
 }
 
-/// Component-wise path comparison; on Windows the comparison is
-/// case-insensitive because NTFS names are case-preserving but
-/// case-insensitive.
-fn path_comps(p: &Path) -> Vec<String> {
-    p.components()
-        .map(|c| {
-            let s = c.as_os_str().to_string_lossy().to_string();
-            #[cfg(target_os = "windows")]
-            let s = s.to_ascii_lowercase();
-            s
-        })
-        .collect()
+/// The comparison key of one path component; on Windows the comparison
+/// is case-insensitive because NTFS names are case-preserving but
+/// case-insensitive. Borrowing, not allocating (except the Windows
+/// lowercase fold).
+fn comp_key(c: Component<'_>) -> Cow<'_, str> {
+    let s = c.as_os_str().to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        s.to_ascii_lowercase().into()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        s
+    }
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
-    path_comps(a) == path_comps(b)
+    a.components()
+        .map(comp_key)
+        .eq(b.components().map(comp_key))
 }
 
 /// Whether `child` equals `parent` or sits below it, component-wise.
 fn is_prefix(child: &Path, parent: &Path) -> bool {
-    let c = path_comps(child);
-    let p = path_comps(parent);
-    p.len() <= c.len() && c[..p.len()] == p[..]
+    let mut c = child.components().map(comp_key);
+    let mut p = parent.components().map(comp_key);
+    loop {
+        match (p.next(), c.next()) {
+            (None, _) => return true,
+            (Some(pv), Some(cv)) => {
+                if pv != cv {
+                    return false;
+                }
+            }
+            (Some(_), None) => return false,
+        }
+    }
 }
 
 /// Refuse a copy whose destination is the source or sits inside it (or
@@ -605,10 +613,20 @@ fn latest_version_dir(dir: &Path) -> Result<Option<String>> {
 
 /// A source resolved to concrete bytes or a filesystem location.
 enum Materialized {
-    /// A directory already on disk (must not be mutated).
-    Dir(PathBuf),
-    /// A gzipped tarball held in memory.
-    Tarball(Vec<u8>),
+    /// A directory on disk: an existing local pack, or a git clone in a
+    /// temporary directory that removes itself when the transport is
+    /// done.
+    Dir {
+        path: PathBuf,
+        #[allow(dead_code)]
+        guard: Option<TempDir>,
+    },
+    /// A gzipped tarball held in memory, with an optional in-archive
+    /// subpath to locate when unpacking at the destination.
+    Tarball {
+        bytes: Vec<u8>,
+        subpath: Option<String>,
+    },
 }
 
 /// The chain of candidate roots inside an extracted archive: the
@@ -617,15 +635,13 @@ enum Materialized {
 /// wrapper and the repository's own single-child prefixes).
 fn archive_chain(tmp: &Path) -> Vec<PathBuf> {
     let mut chain = vec![tmp.to_path_buf()];
-    let mut cur = tmp.to_path_buf();
     for _ in 0..3 {
-        let Ok(entries) = fs::read_dir(&cur) else {
+        let Ok(entries) = fs::read_dir(chain.last().expect("chain is never empty")) else {
             break;
         };
         let mut entries: Vec<_> = entries.flatten().collect();
         if entries.len() == 1 && entries[0].file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            cur = entries.remove(0).path();
-            chain.push(cur.clone());
+            chain.push(entries.remove(0).path());
         } else {
             break;
         }
@@ -668,34 +684,35 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
             if !p.is_dir() {
                 bail!("fs pack `{}` is not a directory", p.display());
             }
-            Ok(Materialized::Dir(p.clone()))
+            Ok(Materialized::Dir {
+                path: p.clone(),
+                guard: None,
+            })
         }
-        Source::Tarball(bytes) => Ok(Materialized::Tarball(bytes.clone())),
+        Source::Tarball(bytes) => Ok(Materialized::Tarball {
+            bytes: bytes.clone(),
+            subpath: None,
+        }),
         Source::Stdin => {
             let mut buf = Vec::new();
             std::io::stdin()
                 .read_to_end(&mut buf)
                 .context("reading tarball from stdin")?;
-            Ok(Materialized::Tarball(buf))
+            Ok(Materialized::Tarball {
+                bytes: buf,
+                subpath: None,
+            })
         }
         Source::Registry {
             namespace,
             name,
             version,
         } => materialize_registry(namespace, name, version.as_deref(), registry),
-        Source::Url { url, subpath } => {
-            let bytes = get_tarball(url)?;
-            if subpath.is_none() {
-                return Ok(Materialized::Tarball(bytes));
-            }
-            // Extract to a temp dir, then keep the subpath directory.
-            let tmp = temp_dir()?;
-            extract_tarball(&bytes, &tmp, None)?;
-            let sub = subpath.as_deref().unwrap_or_default();
-            let found = locate_subdir(&tmp, sub)
-                .ok_or_else(|| anyhow!("subpath `{sub}` not found in archive"))?;
-            Ok(Materialized::Dir(found))
-        }
+        Source::Url { url, subpath } => Ok(Materialized::Tarball {
+            bytes: get_tarball(url)?,
+            subpath: subpath.clone(),
+        }),
+        Source::GithubRepo { owner, repo } => materialize_github_repo(owner, repo),
         Source::GithubTree { owner, repo, rest } => materialize_github_tree(owner, repo, rest),
         Source::GithubRelease { repo, tag } => materialize_github_release(repo, tag.as_deref()),
     }
@@ -704,7 +721,10 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
 /// Resolve a GitHub tree URL: the ref may contain slashes, so try
 /// interpretations from the longest ref to the shortest one. Only a
 /// definitive miss ([`FetchError::NotFound`]) moves on to the next
-/// candidate; a broken payload or a transport failure aborts.
+/// Resolve a GitHub tree URL by cloning the repository with git: the
+/// ref may contain slashes, so try interpretations from the longest ref
+/// to the shortest one. A clone failure moves on to the next candidate
+/// ref (the tree may simply not exist under it).
 fn materialize_github_tree(owner: &str, repo: &str, rest: &[String]) -> Result<Materialized> {
     if rest.is_empty() {
         bail!("invalid GitHub tree URL: no ref after `tree/`");
@@ -712,34 +732,114 @@ fn materialize_github_tree(owner: &str, repo: &str, rest: &[String]) -> Result<M
     let mut last_err = None;
     for k in (1..=rest.len()).rev() {
         let ref_name = rest[..k].join("/");
-        let subpath = if rest.len() > k {
-            Some(rest[k..].join("/"))
-        } else {
-            None
-        };
-        let url = format!("https://codeload.github.com/{owner}/{repo}/tar.gz/{ref_name}");
-        match get_tarball(&url) {
-            Ok(bytes) => {
-                if subpath.is_none() {
-                    return Ok(Materialized::Tarball(bytes));
-                }
-                let tmp = temp_dir()?;
-                extract_tarball(&bytes, &tmp, None)?;
-                let sub = subpath.as_deref().unwrap_or_default();
-                return match locate_subdir(&tmp, sub) {
-                    Some(dir) => Ok(Materialized::Dir(dir)),
-                    None => Err(anyhow!("subpath `{sub}` not found in archive of `{url}`")),
+        let subpath = (rest.len() > k).then(|| rest[k..].join("/"));
+        let tmp = TempDir::system("clone")?;
+        match git_clone_shallow(
+            &format!("https://github.com/{owner}/{repo}"),
+            Some(&ref_name),
+            tmp.path(),
+        ) {
+            Ok(()) => {
+                let dir = match subpath {
+                    Some(sub) => locate_subdir(tmp.path(), &sub).ok_or_else(|| {
+                        anyhow!("subpath `{sub}` not found in `{owner}/{repo}` at `{ref_name}`")
+                    })?,
+                    None => find_pack_root(tmp.path())?,
                 };
+                return Ok(Materialized::Dir {
+                    path: dir,
+                    guard: Some(tmp),
+                });
             }
-            Err(FetchError::NotFound(e)) => last_err = Some(anyhow!("{e}")),
-            Err(e) => return Err(anyhow!("{e}")),
+            Err(e) => last_err = Some(e),
         }
     }
     Err(last_err.unwrap_or_else(|| anyhow!("could not resolve GitHub tree URL")))
 }
 
-/// Resolve a GitHub release URL through the API: prefer a `.tar.gz`/`.tgz`
-/// asset, fall back to the source archive of the resolved tag.
+/// Clone the default branch of a GitHub repository root (or `.git`
+/// URL) into a self-cleaning temporary directory.
+fn materialize_github_repo(owner: &str, repo: &str) -> Result<Materialized> {
+    let tmp = TempDir::system("clone")?;
+    git_clone_shallow(
+        &format!("https://github.com/{owner}/{repo}"),
+        None,
+        tmp.path(),
+    )?;
+    let dir = find_pack_root(tmp.path())?;
+    Ok(Materialized::Dir {
+        path: dir,
+        guard: Some(tmp),
+    })
+}
+
+/// Run `git` with the network red-line applied: the child process is
+/// killed once the 120 s total budget is used up, so the command never
+/// hangs.
+fn run_git(args: &[String]) -> Result<()> {
+    let mut child = std::process::Command::new("git")
+        .args(args)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let mut stderr = Vec::new();
+                let _ = stderr_pipe.read_to_end(&mut stderr);
+                if !status.success() {
+                    bail!(
+                        "git {} failed: {}",
+                        args.join(" "),
+                        String::from_utf8_lossy(&stderr).trim()
+                    );
+                }
+                return Ok(());
+            }
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("git {} timed out", args.join(" "));
+            }
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+/// `git clone --depth 1 [--branch <ref>] url dest`. `--branch` covers
+/// branches and tags; for commit SHAs it falls back to a default-branch
+/// clone plus an explicit detached checkout.
+fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()> {
+    let mut args = vec!["clone".to_string(), "--depth".to_string(), "1".to_string()];
+    if let Some(r) = git_ref {
+        args.push("--branch".to_string());
+        args.push(r.to_string());
+    }
+    args.push(url.to_string());
+    args.push(dest.to_string_lossy().to_string());
+    if run_git(&args).is_ok() || git_ref.is_none() {
+        return Ok(());
+    }
+    // Retry without `--branch`, then check out the requested commit.
+    let retry = vec![
+        "clone".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        url.to_string(),
+        dest.to_string_lossy().to_string(),
+    ];
+    run_git(&retry)?;
+    let checkout = vec![
+        "-C".to_string(),
+        dest.to_string_lossy().to_string(),
+        "checkout".to_string(),
+        git_ref.expect("ref was set").to_string(),
+    ];
+    run_git(&checkout)
+}
+
 fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materialized> {
     let api = match tag {
         Some(t) => format!(
@@ -753,16 +853,14 @@ fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materiali
         String::from_utf8(body).map_err(|_| anyhow!("release response from {api} is not UTF-8"))?;
     let value = json_parse(&text, &format!("release response from {api}"))?;
     if let Some(url) = release_archive_asset(&value) {
-        return Ok(Materialized::Tarball(get_tarball(&url)?));
+        return Ok(Materialized::Tarball {
+            bytes: get_tarball(&url)?,
+            subpath: None,
+        });
     }
-    // No archive asset: fall back to the source archive of the tag.
-    let tag_name = value
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("release lookup for `{repo}` returned no tag_name"))?;
-    Ok(Materialized::Tarball(get_tarball(&format!(
-        "https://codeload.github.com/{repo}/tar.gz/refs/tags/{tag_name}"
-    ))?))
+    // No packaged archive: fail, per admin direction -- no source
+    // archive fallback.
+    bail!("release for `{repo}` has no packaged `.tar.gz`/`.tgz` asset to download")
 }
 
 /// The first `.tar.gz`/`.tgz` asset download URL of a parsed release
@@ -797,7 +895,10 @@ fn materialize_registry(
         if !dir.is_dir() {
             bail!("local pack `{}` not found", dir.display());
         }
-        return Ok(Materialized::Dir(dir));
+        return Ok(Materialized::Dir {
+            path: dir,
+            guard: None,
+        });
     }
     match registry {
         None if namespace == "preview" => {
@@ -805,9 +906,10 @@ fn materialize_registry(
                 Some(v) => v.to_string(),
                 None => latest_official_version(name)?,
             };
-            Ok(Materialized::Tarball(get_tarball(&format!(
-                "{OFFICIAL_REGISTRY}/{name}-{version}.tar.gz"
-            ))?))
+            Ok(Materialized::Tarball {
+                bytes: get_tarball(&format!("{OFFICIAL_REGISTRY}/{name}-{version}.tar.gz"))?,
+                subpath: None,
+            })
         }
         Some(url) => {
             // A GitHub repository acting as a packages registry, using the
@@ -833,13 +935,14 @@ fn materialize_registry(
                 if repo.is_empty() {
                     bail!("invalid GitHub registry `{url}`");
                 }
-                let bytes = get_tarball(&format!(
-                    "https://codeload.github.com/{owner}/{repo}/tar.gz/HEAD"
-                ))?;
-                let tmp = temp_dir()?;
-                extract_tarball(&bytes, &tmp, None)?;
-                let pkg_base = find_in_chain(&tmp, &format!("packages/{namespace}/{name}"))
-                    .or_else(|| find_in_chain(&tmp, &format!("packages/{name}")))
+                let tmp = TempDir::system("clone")?;
+                git_clone_shallow(
+                    &format!("https://github.com/{owner}/{repo}"),
+                    None,
+                    tmp.path(),
+                )?;
+                let pkg_base = find_in_chain(tmp.path(), &format!("packages/{namespace}/{name}"))
+                    .or_else(|| find_in_chain(tmp.path(), &format!("packages/{name}")))
                     .ok_or_else(|| {
                         anyhow!("package `{namespace}/{name}` not found in registry `{url}`")
                     })?;
@@ -848,16 +951,22 @@ fn materialize_registry(
                     None => latest_version_dir(&pkg_base)?
                         .ok_or_else(|| anyhow!("no version of `{name}` in registry `{url}`"))?,
                 };
-                return Ok(Materialized::Dir(pkg_base.join(version)));
+                return Ok(Materialized::Dir {
+                    path: pkg_base.join(version),
+                    guard: Some(tmp),
+                });
             }
             let version = match version {
                 Some(v) => v.to_string(),
                 None => latest_index_version(url, name)?,
             };
-            Ok(Materialized::Tarball(get_tarball(&format!(
-                "{}/{name}-{version}.tar.gz",
-                url.trim_end_matches('/')
-            ))?))
+            Ok(Materialized::Tarball {
+                bytes: get_tarball(&format!(
+                    "{}/{name}-{version}.tar.gz",
+                    url.trim_end_matches('/')
+                ))?,
+                subpath: None,
+            })
         }
         None => bail!("namespace `{namespace}` requires a custom registry: pass --registry <URL>"),
     }
@@ -910,21 +1019,26 @@ fn latest_from_index_json(text: &str, name: &str) -> Result<String> {
 /// and the rest below it. This is not an arbitrary-depth search: the
 /// first segment must be a direct child at some level of the descent.
 fn find_dir(root: &Path, rel: &str) -> Option<PathBuf> {
-    fn walk(dir: &Path, rel: &[&str]) -> Option<PathBuf> {
-        if rel.is_empty() {
-            return Some(dir.to_path_buf());
-        }
+    fn walk(dir: &Path, rel: &str) -> Option<PathBuf> {
+        let (first, rest) = match rel.split_once('/') {
+            Some((f, r)) => (f, Some(r)),
+            None => (rel, None),
+        };
         for entry in fs::read_dir(dir).ok()?.flatten() {
-            if entry.file_type().ok()?.is_dir() && entry.file_name().to_string_lossy() == rel[0] {
-                if let Some(found) = walk(&entry.path(), &rel[1..]) {
-                    return Some(found);
+            if entry.file_type().ok()?.is_dir() && entry.file_name().to_string_lossy() == first {
+                match rest {
+                    None => return Some(entry.path()),
+                    Some(rest) => {
+                        if let Some(found) = walk(&entry.path(), rest) {
+                            return Some(found);
+                        }
+                    }
                 }
             }
         }
         None
     }
-    let parts: Vec<&str> = rel.split('/').collect();
-    walk(root, &parts)
+    walk(root, rel)
 }
 
 /// A fresh private temporary directory for this process.
@@ -952,6 +1066,13 @@ impl TempDir {
     /// the final destination.
     fn next_to(path: &Path, label: &str) -> Result<Self> {
         let dir = path.with_file_name(format!(".typship-tmp-{label}-{}", temp_suffix()));
+        fs::create_dir(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    /// A temp dir under the system temporary directory.
+    fn system(label: &str) -> Result<Self> {
+        let dir = std::env::temp_dir().join(format!(".typship-tmp-{label}-{}", temp_suffix()));
         fs::create_dir(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
         Ok(Self(dir))
     }
@@ -1000,31 +1121,12 @@ fn move_dir_atomic(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))
 }
 
-fn temp_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir();
-    let dir = base.join(format!(
-        "typship-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos())
-            .unwrap_or(0)
-    ));
-    // Fail loudly instead of writing into a shared directory.
-    fs::create_dir(&dir).with_context(|| format!("creating temp dir {}", dir.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(dir)
-}
-
+/// Atomically move directory `from` onto `to` via rename. An existing
+/// empty destination directory is replaced; a non-empty one (including
 // ---------------------------------------------------------------------------
 // JSON — read with serde_json (admin direction: standard crates over
 // hand-rolled parsers).
 // ---------------------------------------------------------------------------
-
 use serde_json::Value as Json;
 
 fn json_parse(text: &str, what: &str) -> Result<Json> {
@@ -1058,56 +1160,6 @@ fn octal(field: &[u8]) -> Result<u64> {
     u64::from_str_radix(s, 8).context("invalid octal field in tar header")
 }
 
-/// Windows reserved device names; a component whose stem (before the
-/// first dot) matches one of these, in any case, cannot exist as a file
-/// or directory on Windows.
-const WINDOWS_RESERVED: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-];
-
-/// Validate an archive member path: it must be relative, slash-separated
-/// UTF-8 text that stays inside the destination and can exist on every
-/// supported filesystem — no drive letters or NTFS streams (colons), no
-/// reserved device names, no trailing dots or spaces. A single trailing
-/// slash (the conventional directory entry spelling) is tolerated.
-fn safe_member_path(path: &str) -> Result<String> {
-    // Directory entries conventionally end in `/`; drop that one slash
-    // before the component checks (internal empty components stay
-    // rejected).
-    let path = path.strip_suffix('/').unwrap_or(path);
-    if path.is_empty() {
-        bail!("empty archive member path");
-    }
-    if path.starts_with('/') {
-        bail!("absolute path `{path}` in archive");
-    }
-    if path.contains('\\') {
-        bail!("backslash in archive path `{path}`");
-    }
-    if path.contains(':') {
-        bail!("colon in archive path `{path}`");
-    }
-    for comp in path.split('/') {
-        if comp == ".." {
-            bail!("parent directory component in archive path `{path}`");
-        }
-        if comp.is_empty() {
-            bail!("empty component in archive path `{path}`");
-        }
-        if comp.ends_with('.') || comp.ends_with(' ') {
-            bail!(
-                "component `{comp}` in archive path `{path}` ends with a dot or space, which Windows cannot address"
-            );
-        }
-        let stem = comp.split('.').next().unwrap_or_default();
-        if WINDOWS_RESERVED.contains(&stem.to_ascii_uppercase().as_str()) {
-            bail!("component `{comp}` in archive path `{path}` is a reserved Windows device name");
-        }
-    }
-    Ok(path.to_string())
-}
-
 /// Extract a gzipped tarball into `dest`, keeping only entries under the
 /// optional `subpath` (relative to the archive root). No prefix is
 /// stripped here; the pack root is located afterwards by
@@ -1133,22 +1185,25 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
             ) {
                 bail!("tar member is a {etype:?}; link/device members are not supported");
             }
-            // The crate's own PAX lookups (path, size) silently drop
-            // malformed records; validate every record explicitly.
-            if let Some(exts) = entry
-                .pax_extensions()
-                .with_context(|| "malformed PAX records in archive")?
-            {
-                for record in exts {
-                    record.with_context(|| "malformed PAX record in archive")?;
-                }
-            }
             // A global PAX header carries defaults this reader does not
-            // apply: validate its records above, then skip it entirely.
+            // apply: the crate skips it during unpack, and so do we.
             if etype == tar::EntryType::XGlobalHeader {
                 continue;
             }
             let raw_path = entry.path().context("invalid tar member path")?;
+            // The tar crate's own unpack rules (which typst relies on)
+            // are exactly these: no absolute paths, no `..` components.
+            // Nothing more is invented here.
+            if raw_path.is_absolute()
+                || raw_path
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+            {
+                bail!(
+                    "archive member `{}` escapes the destination",
+                    raw_path.display()
+                );
+            }
             let path = raw_path
                 .to_str()
                 .ok_or_else(|| {
@@ -1156,7 +1211,7 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
                 })?
                 .trim_end_matches('/')
                 .to_string();
-            let mut path = safe_member_path(&path)?;
+            let mut path = path;
             if let Some(sub) = subpath {
                 let prefix = format!("{sub}/");
                 if !path.starts_with(&prefix) {
@@ -1212,7 +1267,7 @@ pub fn extract_tarball(gz: &[u8], dest: &Path, subpath: Option<&str>) -> Result<
 pub fn pack_tarball(dir: &Path) -> Result<Vec<u8>> {
     let enc = GzEncoder::new(Vec::new(), Compression::default());
     let mut builder = tar::Builder::new(enc);
-    add_tree(&mut builder, dir, "")?;
+    add_tree(&mut builder, dir)?;
     builder.finish().context("finishing tar archive")?;
     builder
         .into_inner()
@@ -1221,27 +1276,23 @@ pub fn pack_tarball(dir: &Path) -> Result<Vec<u8>> {
         .context("finishing gzip stream")
 }
 
-fn add_tree(builder: &mut tar::Builder<GzEncoder<Vec<u8>>>, dir: &Path, rel: &str) -> Result<()> {
-    if !rel.is_empty() {
-        append_entry(builder, rel, true, &[])?;
-    }
-    let mut entries: Vec<_> = fs::read_dir(dir)
-        .with_context(|| format!("reading {}", dir.display()))?
-        .collect::<std::io::Result<_>>()?;
-    entries.sort_by_key(|e| e.file_name());
-    for entry in entries {
-        let name = entry.file_name().to_string_lossy().to_string();
-        let child_rel = if rel.is_empty() {
-            name.clone()
+fn add_tree(builder: &mut tar::Builder<GzEncoder<Vec<u8>>>, dir: &Path) -> Result<()> {
+    // Deterministic depth-first walk with sorted names (the same order
+    // the hand-written recursion produced), via the walkdir crate.
+    for entry in WalkDir::new(dir).sort_by_file_name().min_depth(1) {
+        let entry = entry.with_context(|| format!("walking {}", dir.display()))?;
+        let rel = entry
+            .path()
+            .strip_prefix(dir)
+            .expect("walkdir paths are below the walked root")
+            .to_string_lossy()
+            .to_string();
+        if entry.file_type().is_dir() {
+            append_entry(builder, &rel, true, &[])?;
         } else {
-            format!("{rel}/{name}")
-        };
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            add_tree(builder, &path, &child_rel)?;
-        } else {
-            let data = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
-            append_entry(builder, &child_rel, false, &data)?;
+            let data = fs::read(entry.path())
+                .with_context(|| format!("reading {}", entry.path().display()))?;
+            append_entry(builder, &rel, false, &data)?;
         }
     }
     Ok(())
@@ -1279,9 +1330,7 @@ fn append_entry(
     });
     header.set_size(if is_dir { 0 } else { data.len() as u64 });
     header.set_mode(if is_dir { 0o755 } else { 0o644 });
-    header.set_mtime(0);
-    header.set_uid(0);
-    header.set_gid(0);
+    // uid/gid/mtime stay at 0: `Header::new_ustar` zeroes every field.
     header.set_cksum();
     builder
         .append(&header, data)
@@ -1314,32 +1363,66 @@ pub fn copy(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     let dest = parse_dest(dst)?;
     let mat = materialize(&source, registry)?;
     match (mat, dest) {
-        (Materialized::Tarball(bytes), Dest::Tarball(path)) => {
-            write_tarball_atomic(&path, &bytes)?;
+        (Materialized::Tarball { bytes, subpath }, Dest::Tarball(path)) => {
+            match subpath {
+                None => write_tarball_atomic(&path, &bytes)?,
+                Some(sub) => {
+                    // Unpack next to the destination, locate the
+                    // subpath, and re-pack just that directory.
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)
+                            .with_context(|| format!("creating {}", parent.display()))?;
+                    }
+                    let tmp = TempDir::next_to(&path, "extract")?;
+                    extract_tarball(&bytes, tmp.path(), None)?;
+                    let found = locate_subdir(tmp.path(), &sub)
+                        .ok_or_else(|| anyhow!("subpath `{sub}` not found in archive"))?;
+                    let bytes = pack_tarball(found.as_path())?;
+                    write_tarball_atomic(&path, &bytes)?;
+                }
+            }
         }
-        (Materialized::Dir(dir), Dest::Tarball(path)) => {
+        (
+            Materialized::Dir {
+                path: dir,
+                guard: _,
+            },
+            Dest::Tarball(path),
+        ) => {
             ensure_distinct(&dir, &path)?;
             let bytes = pack_tarball(&dir)?;
             write_tarball_atomic(&path, &bytes)?;
         }
-        (Materialized::Tarball(bytes), Dest::Dir(path)) => {
+        (Materialized::Tarball { bytes, subpath }, Dest::Dir(path)) => {
             if path.exists() && fs::read_dir(&path)?.next().is_some() {
                 bail!("destination `{}` exists and is not empty", path.display());
             }
             // typst-style atomicity: extract into a temp dir next to the
-            // destination (same mount point), then rename the pack root
-            // into place. A failed extraction leaves no trace at the
-            // destination; a completed one appears atomically.
+            // destination (same mount point), locate the pack root (or
+            // the requested subpath), then rename it into place. A
+            // failed extraction leaves no trace at the destination; a
+            // completed one appears atomically.
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
             let tmp = TempDir::next_to(&path, "extract")?;
             extract_tarball(&bytes, tmp.path(), None)?;
-            let inner = find_pack_root(tmp.path())?;
+            let inner = match subpath.as_deref() {
+                Some(sub) => locate_subdir(tmp.path(), sub)
+                    .ok_or_else(|| anyhow!("subpath `{sub}` not found in archive"))?,
+                None => find_pack_root(tmp.path())?,
+            };
+            let inner = find_pack_root(&inner)?;
             move_dir_atomic(&inner, &path)?;
         }
-        (Materialized::Dir(dir), Dest::Dir(path)) => {
+        (
+            Materialized::Dir {
+                path: dir,
+                guard: _,
+            },
+            Dest::Dir(path),
+        ) => {
             ensure_distinct(&dir, &path)?;
             if path.exists() && fs::read_dir(&path)?.next().is_some() {
                 bail!("destination `{}` exists and is not empty", path.display());
@@ -1357,8 +1440,8 @@ pub fn copy(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
         }
         (mat, Dest::Release { repo, tag }) => {
             let bytes = match mat {
-                Materialized::Tarball(bytes) => bytes,
-                Materialized::Dir(dir) => pack_tarball(&dir)?,
+                Materialized::Tarball { bytes, .. } => bytes,
+                Materialized::Dir { path, .. } => pack_tarball(&path)?,
             };
             let asset_name = match source {
                 Source::Fs(ref p) => format!(
@@ -1541,20 +1624,13 @@ pub fn link(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     }
     // An absolute, lexically normal source target: a relative link must
     // resolve from the destination's directory, not from the cwd.
-    let src_abs = normalize_absolute(
-        &src_dir
-            .canonicalize()
-            .unwrap_or_else(|_| normalize_absolute(&src_dir)),
-    );
+    let src_abs = dunce::canonicalize(&src_dir).unwrap_or_else(|_| absolute_lexical(&src_dir));
     #[cfg(target_os = "windows")]
     {
         if std::os::windows::fs::symlink_dir(&src_abs, &dst_path).is_err() {
             // Without the symlink privilege, fall back to a junction.
-            let dst_abs = normalize_absolute(
-                &dst_path
-                    .canonicalize()
-                    .unwrap_or_else(|_| normalize_absolute(&dst_path)),
-            );
+            let dst_abs =
+                dunce::canonicalize(&dst_path).unwrap_or_else(|_| absolute_lexical(&dst_path));
             let status = std::process::Command::new("cmd")
                 .args([
                     "/C",
@@ -1688,10 +1764,10 @@ mod tests {
             Source::GithubRelease { tag: Some(t), .. } => assert_eq!(t, "v1/beta2"),
             other => panic!("unexpected {other:?}"),
         }
-        // A plain repository URL stays HEAD-based.
+        // A plain repository URL: the default branch, cloned with git.
         assert!(matches!(
             parse_source("https://github.com/o/r").unwrap(),
-            Source::Url { .. }
+            Source::GithubRepo { .. }
         ));
         // Non-pack GitHub URLs fail clearly.
         assert!(parse_source("https://github.com/o/r/blob/main/x").is_err());
@@ -1714,37 +1790,12 @@ mod tests {
 
     #[test]
     fn extract_rejects_escape_attempts() {
-        for evil in [
-            "../evil.txt",
-            "/abs.txt",
-            "a\\b.txt",
-            "C:/x.txt",
-            "a/../../b.txt",
-        ] {
+        for evil in ["../evil.txt", "/abs.txt", "a/../../b.txt"] {
             let gz = gz_of(&[(evil, b"x")]);
             let dest = std::env::temp_dir().join(format!("typship-x-{}", std::process::id()));
             let _ = fs::remove_dir_all(&dest);
             assert!(extract_tarball(&gz, &dest, None).is_err(), "case {evil}");
             let _ = fs::remove_dir_all(&dest);
-        }
-    }
-
-    #[test]
-    fn extract_rejects_windows_hostile_paths() {
-        for evil in [
-            "a:stream.txt",  // NTFS alternate data stream
-            "CON/settings",  // reserved device name as a directory
-            "out/COM1.txt",  // reserved device name as a file stem
-            "out/lpt9.dat",  // case-insensitive reserved name
-            "out/trailing.", // trailing dot component
-            "out/trailing ", // trailing space component
-            "out//x.txt",    // empty component
-        ] {
-            assert!(safe_member_path(evil).is_err(), "case {evil:?}");
-        }
-        // Friendly names stay valid.
-        for ok in ["src/lib.typ", "out/CONCEPT.txt", "out/v1.0/read me.md"] {
-            assert!(safe_member_path(ok).is_ok(), "case {ok:?}");
         }
     }
 
@@ -1842,28 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_pax_records_are_refused() {
-        // R7-3 regression: the crate's own PAX lookups silently drop
-        // malformed records; the reader validates them explicitly.
-        let payload = b"BAD
-";
-        let mut raw = Vec::new();
-        raw.extend_from_slice(&raw_header(b"p", b'x', payload.len()));
-        raw.extend_from_slice(payload);
-        raw.extend_from_slice(&vec![0u8; (512 - payload.len() % 512) % 512]);
-        raw.extend_from_slice(&tar_file_entry("f.txt", b"x"));
-        raw.extend_from_slice(&[0u8; 1024]);
-        let gz = gz_of_raw(&raw);
-        let dest = std::env::temp_dir().join(format!("typship-mp-{}", std::process::id()));
-        fs::create_dir_all(&dest).unwrap();
-        assert!(extract_tarball(&gz, &dest, None).is_err());
-        let _ = fs::remove_dir_all(&dest);
-    }
-
-    #[test]
     fn global_pax_headers_are_validated_and_skipped() {
-        // R7-4: a global PAX header (typeflag 'g') is validated
-        // record-wise and skipped -- not refused, not applied.
+        // R7-4: a global PAX header (typeflag 'g') is skipped -- not
+        // refused, not applied (record-wise validation was removed
+        // with the typst-alignment).
         let mut raw = Vec::new();
         raw.extend_from_slice(&raw_header(b"p", b'g', 0));
         raw.extend_from_slice(&tar_file_entry("f.txt", b"x"));
