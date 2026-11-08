@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use anyhow::Result;
 use palc::Parser;
 
-use crate::{manifest, pack};
+use crate::{download, manifest, pack};
 
 /// A simple package manager for Typst.
 #[derive(Debug, palc::Parser)]
@@ -31,6 +31,7 @@ enum Command {
     Init,
     Copy(CopyArgs),
     Link(LinkArgs),
+    Download(DownloadArgs),
     /// Print the help message.
     Help,
 }
@@ -61,6 +62,17 @@ struct LinkArgs {
     registry: Option<String>,
 }
 
+/// Download a package from a registry into the local cache.
+#[derive(Debug, palc::Args)]
+#[command(long_about = "Download a package from a registry into the local cache.")]
+struct DownloadArgs {
+    /// Package spec: `name` or `name:version`.
+    spec: String,
+    /// Base URL of a custom registry.
+    #[arg(long)]
+    registry: Option<String>,
+}
+
 /// Renders the top-level help message via `palc`.
 fn render_help() -> String {
     Cli::render_long_help("typship")
@@ -77,6 +89,10 @@ pub fn dispatch(args: impl Iterator<Item = OsString>) -> Result<()> {
             Some(Command::Init) => manifest::init_current_dir(),
             Some(Command::Copy(args)) => pack::copy(&args.src, &args.dst, args.registry.as_deref()),
             Some(Command::Link(args)) => pack::link(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Download(args)) => download::run(&download::Download {
+                spec: args.spec,
+                registry: args.registry,
+            }),
             Some(Command::Help) | None => {
                 println!("{}", render_help());
                 Ok(())
