@@ -10,7 +10,9 @@ use std::ffi::OsString;
 use anyhow::Result;
 use palc::Parser;
 
-use crate::{manifest, pack};
+use typship_pack::copy::{copy, link};
+
+use crate::manifest;
 
 /// A simple package manager for Typst.
 #[derive(Debug, palc::Parser)]
@@ -75,8 +77,8 @@ pub fn dispatch(args: impl Iterator<Item = OsString>) -> Result<()> {
         }
         Ok(cli) => match cli.command {
             Some(Command::Init) => manifest::init_current_dir(),
-            Some(Command::Copy(args)) => pack::copy(&args.src, &args.dst, args.registry.as_deref()),
-            Some(Command::Link(args)) => pack::link(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Copy(args)) => copy(&args.src, &args.dst, args.registry.as_deref()),
+            Some(Command::Link(args)) => link(&args.src, &args.dst, args.registry.as_deref()),
             Some(Command::Help) | None => {
                 println!("{}", render_help());
                 Ok(())

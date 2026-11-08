@@ -4,7 +4,6 @@
 
 mod cli;
 mod manifest;
-mod pack;
 
 use anyhow::Result;
 

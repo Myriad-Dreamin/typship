@@ -13,19 +13,10 @@ rust-version.workspace = true
 
 [dependencies]
 
+typship-pack = { path = "../typship-pack" }
 anyhow.workspace = true
-ureq.workspace = true
-flate2.workspace = true
-tar.workspace = true
-serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true
-percent-encoding.workspace = true
-path-clean.workspace = true
-walkdir.workspace = true
-dunce.workspace = true
-url.workspace = true
-dirs.workspace = true
 palc.workspace = true
 
 [lints]
