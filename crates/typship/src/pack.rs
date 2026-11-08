@@ -6,6 +6,8 @@
 //! percent-encoding with `percent-encoding`, and TOML manifest writing
 //! (in [`crate::manifest`]) with `toml`. No hand-written parsers or
 //! encoders for standard formats remain (admin direction 2026-11-08).
+//! Directory traversal uses `walkdir`, URL parsing uses `url`, and
+//! verbatim-free canonicalization uses `dunce`.
 //!
 //! Safety posture for untrusted archives, aligned with typst's own
 //! unpacking rules: member paths are validated (no absolute paths, no
@@ -718,9 +720,6 @@ fn materialize(src: &Source, registry: Option<&str>) -> Result<Materialized> {
     }
 }
 
-/// Resolve a GitHub tree URL: the ref may contain slashes, so try
-/// interpretations from the longest ref to the shortest one. Only a
-/// definitive miss ([`FetchError::NotFound`]) moves on to the next
 /// Resolve a GitHub tree URL by cloning the repository with git: the
 /// ref may contain slashes, so try interpretations from the longest ref
 /// to the shortest one. A clone failure moves on to the next candidate
@@ -1174,8 +1173,6 @@ fn move_dir_atomic(from: &Path, to: &Path) -> Result<()> {
     fs::rename(from, to).with_context(|| format!("moving {} to {}", from.display(), to.display()))
 }
 
-/// Atomically move directory `from` onto `to` via rename. An existing
-/// empty destination directory is replaced; a non-empty one (including
 // ---------------------------------------------------------------------------
 // JSON — read with serde_json (admin direction: standard crates over
 // hand-rolled parsers).
@@ -1183,12 +1180,11 @@ fn move_dir_atomic(from: &Path, to: &Path) -> Result<()> {
 use serde_json::Value as Json;
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
 // tar reading — the `tar` crate over a strict multi-member gzip stream
 // (admin direction: standard crates over hand-rolled parsers). The
 // crate verifies header checksums, handles ustar/GNU/PAX long names and
-// rejects malformed frames; this layer keeps the resource budgets, the
-// member-type allowlist and the archive-path validation.
+// rejects malformed frames; this layer keeps the member-type allowlist
+// and the archive-path validation.
 // ---------------------------------------------------------------------------
 
 /// Parse an octal field, tolerating trailing NULs and spaces; anything
@@ -1894,10 +1890,8 @@ mod tests {
 
     #[test]
     fn pax_size_record_governs_the_member_length() {
-        // R7-1 regression: a PAX `size` record overrides the ustar
-        // header's (stale) size field; the reader must honor the
-        // resolved entry size, not the raw header size that silently
-        // truncated the member to an empty file.
+        // A PAX `size` record overrides the ustar header's (stale)
+        // size field; the reader honors the resolved entry size.
         let payload = b"9 size=5
 ";
         let mut raw = Vec::new();
@@ -1918,8 +1912,8 @@ mod tests {
 
     #[test]
     fn concatenated_tar_after_the_end_marker_is_refused() {
-        // R7-2 regression: valid tar members after the end-of-archive
-        // marker must be refused -- they could overwrite earlier files.
+        // Valid tar members after the end-of-archive marker are
+        // refused: they could overwrite earlier files.
         let mut raw = Vec::new();
         raw.extend_from_slice(&raw_header(b"f.txt", b'0', 1));
         raw.extend_from_slice(b"A");
@@ -1954,10 +1948,10 @@ mod tests {
     }
 
     #[test]
-    fn global_pax_headers_are_validated_and_skipped() {
-        // R7-4: a global PAX header (typeflag 'g') is skipped -- not
-        // refused, not applied (record-wise validation was removed
-        // with the typst-alignment).
+    fn global_pax_headers_are_skipped() {
+        // A global PAX header (typeflag 'g') is skipped -- not refused,
+        // not applied (record-wise validation removed with the
+        // typst-alignment).
         let mut raw = Vec::new();
         raw.extend_from_slice(&raw_header(b"p", b'g', 0));
         raw.extend_from_slice(&tar_file_entry("f.txt", b"x"));
@@ -2008,18 +2002,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dest);
     }
 
-    // PAX/长名记录的帧解析与严格性现在由 `tar` crate 内部保证，
-    // 旧的自写解码器测试（pax_path_record_is_parsed_by_length、
-    // pax_malformed_records_are_errors_not_panics、
-    // pending_name_overrides_never_leak_to_the_next_member、
-    // single_zero_block_is_not_a_complete_end_marker）随之删除；
-    // crate 对「缺结束块」静默接受的严格性让渡也已记录在案。
+    // PAX/长名记录的帧解析与严格性由 `tar` crate 内部保证，旧的自写
+    // 解码器测试随之删除；crate 对「缺结束块」静默接受的语义已记录。
 
     #[test]
     fn json_duplicate_keys_are_last_wins() {
-        // R7-5: serde_json object semantics -- a repeated key's last
-        // value wins (the previous hand-written parser kept the first).
-        // Declared behavior; callers must not rely on first-wins.
+        // serde_json object semantics: a repeated key's last value
+        // wins. Declared behavior; callers must not rely on first-wins.
         let value =
             serde_json::from_str::<Json>(r#"{"version":"1.0.0","version":"2.0.0"}"#).unwrap();
         assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("2.0.0"));
@@ -2223,7 +2212,7 @@ mod tests {
     #[test]
     fn writer_output_roundtrips_through_reader() {
         // The writer's own directory entries (trailing `/`) must be
-        // accepted by the reader (R3-1 regression).
+        // accepted by the reader.
         let base = std::env::temp_dir().join(format!("typship-wr-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let src = base.join("src");
@@ -2315,7 +2304,7 @@ mod tests {
     fn locate_subdir_has_no_arbitrary_depth_search() {
         // The contract: only the single-subdirectory chain (up to three
         // levels) is traversed; a first segment deeper than that is not
-        // found (R5-1 regression, documents the limitation).
+        // found (documents the limitation).
         let base = std::env::temp_dir().join(format!("typship-deep-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let deep = base.join("a").join("b").join("c").join("d").join("target");
@@ -2348,7 +2337,7 @@ mod tests {
     #[test]
     fn locate_subdir_crosses_wrapper_and_single_chain() {
         // A GitHub wrapper followed by the repository's own single-child
-        // directory: the full subpath must resolve (R3-4 regression).
+        // directory: the full subpath must resolve.
         let base = std::env::temp_dir().join(format!("typship-ls-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let sub = base.join("repo-HEAD").join("sub");
