@@ -1622,6 +1622,48 @@ fn percent_encode(s: &str) -> String {
     utf8_percent_encode(s, UNRESERVED).to_string()
 }
 
+/// Download a registry pack into the cache directory as
+/// `{cache}/{name}@{version}`: the latest version is resolved when
+/// none is given, and the pack is fetched and placed atomically via
+/// [`copy`] (temp dir next to the destination, then `rename`).
+pub fn download(
+    name: &str,
+    version: Option<&str>,
+    registry: Option<&str>,
+    cache: &Path,
+) -> Result<PathBuf> {
+    let version = match version {
+        Some(v) => v.to_string(),
+        None => latest_registry_version(registry, name)?,
+    };
+    // The cache must be an absolute fs path so it parses as a
+    // destination; create it up front.
+    fs::create_dir_all(cache)
+        .with_context(|| format!("creating cache directory {}", cache.display()))?;
+    let cache = dunce::canonicalize(cache)?;
+    let dest = cache.join(format!("{name}@{version}"));
+    copy(
+        &format!("@preview/{name}:{version}"),
+        &dest.to_string_lossy(),
+        registry,
+    )?;
+    Ok(dest)
+}
+
+/// Latest version of `name` in the registry: the official index when
+/// `registry` is None, else `{registry}/index.json`. GitHub-hosted
+/// registries are directory-based rather than index-based and are not
+/// supported here (use copy with `@namespace/name` instead).
+pub fn latest_registry_version(registry: Option<&str>, name: &str) -> Result<String> {
+    match registry {
+        None => latest_official_version(name),
+        Some(url) if url.contains("github.com") => bail!(
+            "download does not support GitHub registries (`{url}`); use copy with `@namespace/name` instead"
+        ),
+        Some(url) => latest_index_version(url, name),
+    }
+}
+
 /// Link a named pack from `src` to `dst` instead of copying.
 ///
 /// When both ends are linkable (a filesystem or local-namespace
