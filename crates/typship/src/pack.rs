@@ -766,6 +766,12 @@ fn materialize_github_repo(owner: &str, repo: &str) -> Result<Materialized> {
         None,
         tmp.path(),
     )?;
+    // Git metadata is not pack content; leaving it in would ship it in
+    // the tarball and confuse pack-root detection.
+    let git_dir = tmp.path().join(".git");
+    if git_dir.is_dir() {
+        fs::remove_dir_all(&git_dir)?;
+    }
     let dir = find_pack_root(tmp.path())?;
     Ok(Materialized::Dir {
         path: dir,
@@ -783,12 +789,18 @@ fn run_git(args: &[String]) -> Result<()> {
         .spawn()
         .with_context(|| format!("running git {}", args.join(" ")))?;
     let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    // Drain stderr on its own thread: git writes progress to stderr and
+    // a filled pipe buffer would otherwise deadlock the wait.
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         match child.try_wait()? {
             Some(status) => {
-                let mut stderr = Vec::new();
-                let _ = stderr_pipe.read_to_end(&mut stderr);
+                let stderr = stderr_thread.join().unwrap_or_default();
                 if !status.success() {
                     bail!(
                         "git {} failed: {}",
@@ -799,7 +811,18 @@ fn run_git(args: &[String]) -> Result<()> {
                 return Ok(());
             }
             None if Instant::now() >= deadline => {
-                let _ = child.kill();
+                // Kill the whole process tree: git spawns transport
+                // children that a plain kill on the parent misses.
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &child.id().to_string()])
+                        .status();
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = child.kill();
+                }
                 let _ = child.wait();
                 bail!("git {} timed out", args.join(" "));
             }
@@ -819,10 +842,17 @@ fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()
     }
     args.push(url.to_string());
     args.push(dest.to_string_lossy().to_string());
-    if run_git(&args).is_ok() || git_ref.is_none() {
+    if git_ref.is_none() {
+        run_git(&args)?;
         return Ok(());
     }
-    // Retry without `--branch`, then check out the requested commit.
+    if run_git(&args).is_ok() {
+        return Ok(());
+    }
+    // A failed clone may have left a partial directory behind; a fresh
+    // clone needs it gone.
+    let _ = fs::remove_dir_all(dest);
+    // Retry without `--branch`, then make the requested ref reachable.
     let retry = vec![
         "clone".to_string(),
         "--depth".to_string(),
@@ -835,9 +865,30 @@ fn git_clone_shallow(url: &str, git_ref: Option<&str>, dest: &Path) -> Result<()
         "-C".to_string(),
         dest.to_string_lossy().to_string(),
         "checkout".to_string(),
-        git_ref.expect("ref was set").to_string(),
+        git_ref.unwrap().to_string(),
     ];
-    run_git(&checkout)
+    if run_git(&checkout).is_ok() {
+        return Ok(());
+    }
+    // A commit SHA is not part of a default-branch shallow clone;
+    // fetch it explicitly (GitHub serves arbitrary SHAs).
+    let fetch = vec![
+        "-C".to_string(),
+        dest.to_string_lossy().to_string(),
+        "fetch".to_string(),
+        "--depth".to_string(),
+        "1".to_string(),
+        "origin".to_string(),
+        git_ref.unwrap().to_string(),
+    ];
+    run_git(&fetch)?;
+    let detach = vec![
+        "-C".to_string(),
+        dest.to_string_lossy().to_string(),
+        "checkout".to_string(),
+        "FETCH_HEAD".to_string(),
+    ];
+    run_git(&detach)
 }
 
 fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materialized> {
@@ -851,7 +902,8 @@ fn materialize_github_release(repo: &str, tag: Option<&str>) -> Result<Materiali
     let body = fetch_bytes(&api)?;
     let text =
         String::from_utf8(body).map_err(|_| anyhow!("release response from {api} is not UTF-8"))?;
-    let value = json_parse(&text, &format!("release response from {api}"))?;
+    let value = serde_json::from_str(&text)
+        .map_err(|e| anyhow!("invalid JSON in release response from {api}: {e}"))?;
     if let Some(url) = release_archive_asset(&value) {
         return Ok(Materialized::Tarball {
             bytes: get_tarball(&url)?,
@@ -991,7 +1043,8 @@ fn latest_index_version(base: &str, name: &str) -> Result<String> {
 /// `name` matches, parsed as real JSON (the index is an array of
 /// objects). Pure so tests exercise the production function directly.
 fn latest_from_index_json(text: &str, name: &str) -> Result<String> {
-    let value = json_parse(text, "registry index")?;
+    let value: Json =
+        serde_json::from_str(text).map_err(|e| anyhow!("invalid JSON in registry index: {e}"))?;
     let entries = value
         .as_array()
         .ok_or_else(|| anyhow!("registry index JSON is not an array"))?;
@@ -1128,10 +1181,6 @@ fn move_dir_atomic(from: &Path, to: &Path) -> Result<()> {
 // hand-rolled parsers).
 // ---------------------------------------------------------------------------
 use serde_json::Value as Json;
-
-fn json_parse(text: &str, what: &str) -> Result<Json> {
-    serde_json::from_str(text).map_err(|e| anyhow!("invalid JSON in {what}: {e}"))
-}
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -1287,6 +1336,11 @@ fn add_tree(builder: &mut tar::Builder<GzEncoder<Vec<u8>>>, dir: &Path) -> Resul
             .expect("walkdir paths are below the walked root")
             .to_string_lossy()
             .to_string();
+        if entry.file_type().is_symlink() {
+            // Cloned repositories are untrusted input too: a symlink
+            // would read outside the tree when packed or copied.
+            bail!("symlink `{}` is not pack content", entry.path().display());
+        }
         if entry.file_type().is_dir() {
             append_entry(builder, &rel, true, &[])?;
         } else {
@@ -1347,7 +1401,13 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            // Same rule as pack_tarball: cloned repositories are
+            // untrusted input; never follow links out of the tree.
+            bail!("symlink `{}` is not pack content", entry.path().display());
+        }
+        if ft.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target)
@@ -1539,7 +1599,8 @@ fn upload_release_asset(repo: &str, tag: &str, asset_name: &str, bytes: &[u8]) -
 
 /// Extract `upload_url` from a parsed release document.
 fn release_upload_url(body: &str, tag: &str) -> Result<String> {
-    let value = json_parse(body, "release document")?;
+    let value: Json =
+        serde_json::from_str(body).map_err(|e| anyhow!("invalid JSON in release document: {e}"))?;
     value
         .get("upload_url")
         .and_then(|v| v.as_str())
@@ -1959,7 +2020,8 @@ mod tests {
         // R7-5: serde_json object semantics -- a repeated key's last
         // value wins (the previous hand-written parser kept the first).
         // Declared behavior; callers must not rely on first-wins.
-        let value = json_parse(r#"{"version":"1.0.0","version":"2.0.0"}"#, "doc").unwrap();
+        let value =
+            serde_json::from_str::<Json>(r#"{"version":"1.0.0","version":"2.0.0"}"#).unwrap();
         assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("2.0.0"));
     }
 
@@ -1992,10 +2054,10 @@ mod tests {
     fn json_parsing_rejects_malformed_documents() {
         // serde_json does the parsing; these pin the contract that
         // malformed documents are errors, never scans.
-        assert!(json_parse("{\"a\":}", "doc").is_err());
-        assert!(json_parse("{\"a\":1} trailing", "doc").is_err());
-        assert!(json_parse("01", "doc").is_err());
-        assert!(json_parse(r#""\ud83d""#, "doc").is_err()); // unpaired surrogate
+        assert!(serde_json::from_str::<Json>("{\"a\":}").is_err());
+        assert!(serde_json::from_str::<Json>("{\"a\":1} trailing").is_err());
+        assert!(serde_json::from_str::<Json>("01").is_err());
+        assert!(serde_json::from_str::<Json>(r#"\ud83d"#).is_err()); // unpaired surrogate
         // Surrogate pairs decode correctly.
         let v: Json = serde_json::from_str("{\"e\":\"\\ud83d\\ude00\"}").unwrap();
         assert_eq!(v.get("e").unwrap().as_str(), Some("\u{1F600}"));
