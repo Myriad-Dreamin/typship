@@ -5,7 +5,6 @@
 mod cli;
 mod download;
 mod manifest;
-mod pack;
 
 use anyhow::Result;
 

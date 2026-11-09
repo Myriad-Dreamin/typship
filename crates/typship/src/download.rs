@@ -2,7 +2,7 @@
 //! the local cache.
 //!
 //! Transport, unpacking and placement are entirely the named Pack
-//! implementation ([`crate::pack`]): download is `copy` of a
+//! implementation ([`typship_pack`]): download is `copy` of a
 //! `@preview/...` pack into the cache directory. That inherits the
 //! network red-line (10 s connect / 120 s total per request, never
 //! hangs) and the typst-style atomic placement (unpack into a temp dir
@@ -13,7 +13,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::pack;
+use typship_pack::copy as pack;
 
 /// A parsed `download` invocation.
 #[derive(Debug)]
@@ -69,7 +69,6 @@ fn cache_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     fn split(spec: &str) -> (String, Option<String>) {
         split_spec(spec).unwrap()
@@ -95,78 +94,5 @@ mod tests {
             assert_eq!(cache_dir().unwrap(), dir);
             std::env::remove_var("TYPSHIP_CACHE_DIR");
         }
-    }
-
-    /// Minimal HTTP server answering each connection with a canned
-    /// response (cycled by request order).
-    fn mock_raw_server(responses: &[Vec<u8>]) -> String {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let responses: Vec<_> = responses.to_vec();
-        std::thread::spawn(move || {
-            for response in responses.iter().cycle().take(16) {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-                let mut buf = [0u8; 1024];
-                let _ = std::io::Read::read(&mut stream, &mut buf);
-                let _ = std::io::Write::write_all(&mut stream, response);
-            }
-        });
-        format!("http://{addr}")
-    }
-
-    fn http_response(body: &[u8]) -> Vec<u8> {
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let mut bytes = head.into_bytes();
-        bytes.extend_from_slice(body);
-        bytes
-    }
-
-    /// A gzipped tarball whose root contains the given entries.
-    fn gz_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut builder = tar::Builder::new(Vec::new());
-        for (name, data) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, name, *data).unwrap();
-        }
-        let tarball = builder.into_inner().unwrap();
-        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        gz.write_all(&tarball).unwrap();
-        gz.finish().unwrap()
-    }
-
-    #[test]
-    fn download_resolves_latest_and_places_atomically() {
-        let index = br#"[{"name":"demo","version":"0.1.0"},{"name":"demo","version":"0.2.0"}]"#;
-        let tarball = gz_of(&[("typst.toml", b"[package]\nname = \"demo\"\n".as_slice())]);
-        let url = mock_raw_server(&[http_response(index), http_response(&tarball)]);
-        let cache = std::env::temp_dir().join(format!("typship-dl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache);
-        let dest = pack::download("demo", None, Some(&url), &cache).unwrap();
-        assert_eq!(dest, cache.join("demo@0.2.0"));
-        assert!(dest.join("typst.toml").is_file());
-        // A second download into the same cache: the non-empty
-        // destination is an error, never a silent merge.
-        assert!(pack::download("demo", None, Some(&url), &cache).is_err());
-        let _ = std::fs::remove_dir_all(&cache);
-    }
-
-    #[test]
-    fn download_rejects_path_unsafe_names() {
-        let cache = std::env::temp_dir().join(format!("typship-dl2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&cache);
-        // `..` and slash components are rejected by the pack layer
-        // before any network traffic happens.
-        assert!(pack::download("../evil", None, None, &cache).is_err());
-        assert!(pack::download("a/b", None, None, &cache).is_err());
-        let _ = std::fs::remove_dir_all(&cache);
     }
 }
