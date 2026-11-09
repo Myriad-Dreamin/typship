@@ -28,14 +28,13 @@
 //! request. Response bodies are read in full — no download cap.
 
 pub mod copy;
-pub mod http;
 pub mod dest;
 pub mod fs;
 pub mod github;
+pub mod http;
 pub mod source;
 pub mod transport;
 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
-

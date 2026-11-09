@@ -95,5 +95,4 @@ mod tests {
             std::env::remove_var("TYPSHIP_CACHE_DIR");
         }
     }
-
 }

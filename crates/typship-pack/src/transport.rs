@@ -12,18 +12,18 @@ use anyhow::{Context, Result, anyhow, bail};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use walkdir::WalkDir;
 use serde_json::Value as Json;
+use walkdir::WalkDir;
 
 use std::path::Component;
 
-use crate::fs::{typst_packages_dir, latest_version_dir};
+use crate::fs::{latest_version_dir, typst_packages_dir};
 use crate::http::{fetch_bytes, get_tarball};
 
 /// The manifest that marks the pack root inside an archive.
 pub const PACK_MANIFEST: &str = "typst.toml";
-use crate::source::{Source, OFFICIAL_REGISTRY};
 use crate::github::percent_encode;
+use crate::source::{OFFICIAL_REGISTRY, Source};
 
 /// A source resolved to concrete bytes or a filesystem location.
 pub enum Materialized {

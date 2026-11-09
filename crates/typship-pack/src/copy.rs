@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use dunce;
 
-use crate::fs::{typst_packages_dir, latest_version_dir, ensure_distinct, absolute_lexical};
-use crate::source::{parse_source, Source};
-use crate::dest::{parse_dest, Dest};
-use crate::transport::{materialize, Materialized, pack_tarball, write_tarball_atomic, copy_tree, extract_tarball, find_pack_root, locate_subdir, TempDir, move_dir_atomic};
+use crate::dest::{Dest, parse_dest};
+use crate::fs::{absolute_lexical, ensure_distinct, latest_version_dir, typst_packages_dir};
 use crate::github::upload_release_asset;
+use crate::source::{Source, parse_source};
+use crate::transport::{
+    Materialized, TempDir, copy_tree, extract_tarball, find_pack_root, locate_subdir, materialize,
+    move_dir_atomic, pack_tarball, write_tarball_atomic,
+};
 
 /// Copy (transport) a named pack from `src` to `dst`.
 pub fn copy(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
@@ -116,7 +119,6 @@ pub fn copy(src: &str, dst: &str, registry: Option<&str>) -> Result<()> {
     }
     Ok(())
 }
-
 
 /// Link a named pack from `src` to `dst` instead of copying.
 ///

@@ -5,7 +5,7 @@
 use std::io::Read;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 /// Connect phase timeout; the total request budget is separate.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);

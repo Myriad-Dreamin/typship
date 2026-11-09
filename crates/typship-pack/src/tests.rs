@@ -1,16 +1,14 @@
-
-
 use std::fs;
 use std::io::Write;
 
 use serde_json::Value as Json;
 
 use crate::copy::{download, link};
-use crate::dest::{parse_dest, Dest};
+use crate::dest::{Dest, parse_dest};
 use crate::fs::ensure_distinct;
 use crate::github::release_upload_url;
-use crate::http::{fetch_bytes, get_tarball, FetchError};
-use crate::source::{parse_source, Source};
+use crate::http::{FetchError, fetch_bytes, get_tarball};
+use crate::source::{Source, parse_source};
 use crate::transport::{
     copy_tree, extract_tarball, find_in_chain, find_pack_root, latest_from_index_json,
     locate_subdir, octal, pack_tarball, release_archive_asset,
@@ -20,9 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use flate2::Compression;
 use flate2::read::{GzDecoder, MultiGzDecoder};
 use flate2::write::GzEncoder;
-use flate2::Compression;
 
 #[test]
 fn parse_source_detects_shapes() {
@@ -304,8 +302,7 @@ fn dangling_metadata_headers_are_refused() {
 fn json_duplicate_keys_are_last_wins() {
     // serde_json object semantics: a repeated key's last value
     // wins. Declared behavior; callers must not rely on first-wins.
-    let value =
-        serde_json::from_str::<Json>(r#"{"version":"1.0.0","version":"2.0.0"}"#).unwrap();
+    let value = serde_json::from_str::<Json>(r#"{"version":"1.0.0","version":"2.0.0"}"#).unwrap();
     assert_eq!(value.get("version").and_then(|v| v.as_str()), Some("2.0.0"));
 }
 
@@ -620,8 +617,7 @@ fn locate_subdir_has_no_arbitrary_depth_search() {
 fn truncated_body_is_retried_until_success() {
     // Response declares 20 bytes but delivers 2 and closes: the body
     // read fails, which is transient, so a second request follows.
-    let truncated: &[u8] =
-        b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nok";
+    let truncated: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nok";
     let full: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
     let (url, count) = mock_raw_server(&[truncated, full]);
     let body = fetch_bytes(&format!("{url}/f")).unwrap();

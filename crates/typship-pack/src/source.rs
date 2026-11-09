@@ -241,4 +241,3 @@ pub fn parse_source(s: &str) -> Result<Source> {
         "`{s}` is not a pack source (expected a repository root, tree, archive, release or .git URL)"
     )
 }
-
