@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>typship Guide：Pack 规范、形状速查表与架构指南</title>
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fafafa">
+<script>
+(() => {
+  let mode = "system";
+  try { mode = localStorage.getItem("typship-theme") || "system"; } catch {}
+  const q = matchMedia("(prefers-color-scheme: dark)");
+  const apply = () => {
+    const t = mode === "system" ? (q.matches ? "dark" : "light") : mode;
+    document.documentElement.dataset.theme = t;
+  };
+  q.addEventListener("change", () => mode === "system" && apply());
+  apply();
+})();
+</script>
+<style>
+:root {
+  --bg: #fafafa; --bg2: #f1f1f2; --card: #ffffff;
+  --ink: #111112; --ink2: #4a4a50; --ink3: #85858c;
+  --line: #e4e4e7; --code: #f4f4f5;
+}
+:root[data-theme="dark"] {
+  --bg: #0b0b0c; --bg2: #121214; --card: #161618;
+  --ink: #f2f2f3; --ink2: #b3b3ba; --ink3: #7a7a82;
+  --line: #26262a; --code: #151517;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 16px/1.65 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", system-ui, "PingFang SC", "WenQuanYi Micro Hei", sans-serif;
+}
+a { color: inherit; }
+code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+.wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+nav {
+  position: sticky; top: 0; z-index: 10;
+  backdrop-filter: blur(12px); background: color-mix(in srgb, var(--bg) 84%, transparent);
+  border-bottom: 1px solid var(--line);
+}
+nav .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
+.back { text-decoration: none; font-size: 14px; font-weight: 580; color: var(--ink2); }
+.back:hover { color: var(--ink); }
+main { padding: 48px 0 80px; }
+h1 { font-size: 36px; letter-spacing: -.03em; margin: 0 0 12px; }
+h2 { font-size: 24px; letter-spacing: -.02em; margin: 48px 0 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+p { color: var(--ink2); margin: 0 0 16px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px; margin: 18px 0; overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: 0; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--ink3); }
+code { font-size: 13px; background: var(--code); padding: 1.5px 5px; border-radius: 4px; color: var(--ink); }
+</style>
+</head>
+<body>
+<nav><div class="wrap">
+  <a class="back" href="index.html">← 返回 typship 首页 (Home)</a>
+  <span style="font-size:13px; color:var(--ink3);">typship Guide &amp; Reference</span>
+</div></nav>
+<main class="wrap">
+  <h1>typship 指南：Pack 规范与架构参考</h1>
+  <p>本指南对应 <code>typship</code> 主线（<code>crates/typship</code> 与 <code>crates/typship-pack</code>）的实际实现。</p>
+
+  <h2 id="pack-concept">1. Pack 概念与设计边界（A Concept Weaker than Package）</h2>
+  <p>正式的 Typst <b>Package</b> 必须包含符合规范的 <code>typst.toml</code>（含 <code>name</code>、<code>version</code>、<code>entrypoints</code>）并具有 <code>@namespace/name:version</code> 身份。而 <b>Pack</b> 是比 Package 更弱的抽象：任何承载 Typst 内容的目录树或归档流，无论是否包含 <code>typst.toml</code>，都是一个 Pack。解包或浅克隆时，<code>find_pack_root</code> 会沿最多 3 层单子目录链查找 <code>typst.toml</code>；若不存在清单，则保留原始目录树结构整体搬运。</p>
+
+  <h2 id="shape-matrix">2. Source Pack 与 Destination Pack 形状速查表</h2>
+  <div class="card">
+    <table>
+      <thead><tr><th>Source Pack 输入形状</th><th>解析类型</th><th>物化与传输规则</th></tr></thead>
+      <tbody>
+        <tr><td><code>-</code></td><td><code>Stdin</code></td><td>从标准输入读取完整 gzipped tarball 字节</td></tr>
+        <tr><td><code>*.tar.gz</code> / <code>*.tgz</code></td><td><code>Tarball</code></td><td>本地已存在归档文件直接读入内存</td></tr>
+        <tr><td><code>./dir</code> · <code>/abs</code> · <code>C:\…</code></td><td><code>Fs</code></td><td>本地目录（严拒任何 symlink）</td></tr>
+        <tr><td><code>@local/name[:ver]</code></td><td><code>Registry(local)</code></td><td>系统 Typst 数据目录 <code>packages/local/name/[ver]</code>，省略版本取最大版本</td></tr>
+        <tr><td><code>@preview/name[:ver]</code></td><td><code>Registry(preview)</code></td><td>官方 <code>index.json</code> 解析最新版并下载 <code>{name}-{ver}.tar.gz</code></td></tr>
+        <tr><td><code>@ns/name[:ver]</code> + <code>--registry</code></td><td><code>Registry(custom)</code></td><td>GitHub 仓库 URL 浅克隆 <code>packages/{ns}/{name}/{ver}</code>；HTTP URL 走 <code>index.json</code></td></tr>
+        <tr><td><code>github.com/{o}/{r}[.git]</code></td><td><code>GithubRepo</code></td><td>浅克隆默认分支，剥离 <code>.git</code>，沿 ≤3 层单子目录链定位 <code>typst.toml</code></td></tr>
+        <tr><td><code>github.com/{o}/{r}/tree/{ref[/sub]}</code></td><td><code>GithubTree</code></td><td>从最长含斜杠候选 ref 向短逐次浅克隆试探，再定位子路径</td></tr>
+        <tr><td><code>…/releases/latest</code> · <code>tag/{t}</code> · <code>{t}</code></td><td><code>GithubRelease</code></td><td>经 GitHub API 取首个 <code>.tar.gz</code>/<code>.tgz</code> 资产（无源码归档回退）</td></tr>
+        <tr><td><code>…/archive/…</code> · <code>https://…</code></td><td><code>Url</code></td><td>直链下载 gzipped tarball</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead><tr><th>Destination Pack 输入形状</th><th>解析类型</th><th>原子落盘行为</th></tr></thead>
+      <tbody>
+        <tr><td>本地目录路径</td><td><code>Dest::Dir</code></td><td>目标非空则拒绝；在同挂载点紧邻建临时目录解包/拷贝并定位包根后 <code>rename</code> 到位</td></tr>
+        <tr><td><code>*.tar.gz</code> / <code>*.tgz</code></td><td><code>Dest::Tarball</code></td><td>按文件名排序生成确定性 <code>ustar</code>（权限 0644/0755，mtime=0），临时文件原子写入</td></tr>
+        <tr><td><code>github.com/{o}/{r}/releases/[tag/]{t}</code></td><td><code>Dest::Release</code></td><td>使用 <code>GITHUB_TOKEN</code> / <code>TYPSHIP_TOKEN</code> 上传资产；404 时自动创建 Release</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="security-atomicity">3. 解包安全、确定性归档与超时红线</h2>
+  <p><b>Typst 对齐解包校验：</b>仅接受普通文件与目录成员；严拒绝对路径、<code>..</code> 组件、非 UTF-8 成员名以及任何符号链接/设备节点。<b>物理路径防嵌套：</b><code>ensure_distinct</code> 将源与目标解析为物理路径后按组件比较，拒绝自我嵌套。<b>网络与 Git 超时：</b>HTTP 10s 连接 / 120s 总超时（仅对传输错误、429、5xx 重试 3 次）；<code>git</code> 子进程 120s 看门狗超时整树终止。</p>
+
+  <h2 id="architecture">4. 双 Crate 架构</h2>
+  <p><code>crates/typship</code> 负责命令行解析（基于 <code>palc</code>）、<code>init</code> 清单生成与 <code>download</code> 缓存入口；<code>crates/typship-pack</code> 独立封装 Named Pack 的源/目标识别（<code>source.rs</code> / <code>dest.rs</code>）、传输与解包打包（<code>transport.rs</code>）、<code>copy/link</code>（<code>copy.rs</code>）及 HTTP/GitHub 交互。</p>
+</main>
+</body>
+</html>

@@ -1,0 +1,1903 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title data-i18n="meta.title">typship：以 Pack 为核心的 Typst 内容与包管理工具</title>
+<meta name="description" content="typship 提出比 Package 更弱的 Pack 概念：支持多种 Source Pack 与 Destination Pack，按形状自动识别、提取包根、确定性打包并原子落盘。">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#fafafa">
+<script>
+(() => {
+  let mode = "system";
+  try { mode = localStorage.getItem("typship-theme") || "system"; } catch {}
+  let lang = "zh";
+  try { lang = localStorage.getItem("typship-lang") || "zh"; } catch {}
+  window.LANG = lang;
+  window.T = (zh, en) => (window.LANG === "en" ? en : zh);
+  window.themeTitle = (m) => window.T(
+    "主题：" + { system: "跟随系统", light: "浅色", dark: "深色" }[m],
+    "Theme: " + m
+  );
+  const q = matchMedia("(prefers-color-scheme: dark)");
+  const apply = () => {
+    const t = mode === "system" ? (q.matches ? "dark" : "light") : mode;
+    document.documentElement.dataset.theme = t;
+    const tc = document.querySelector('meta[name="theme-color"]');
+    if (tc) tc.content = t === "dark" ? "#0b0b0c" : "#fafafa";
+    document.querySelectorAll("button.theme[data-theme-btn]").forEach((b) => {
+      b.dataset.mode = mode;
+      b.title = window.themeTitle(mode);
+    });
+  };
+  q.addEventListener("change", () => mode === "system" && apply());
+  window.setTheme = (m) => {
+    mode = m;
+    try { m === "system" ? localStorage.removeItem("typship-theme") : localStorage.setItem("typship-theme", m); } catch {}
+    apply();
+  };
+  window.themeMode = () => mode;
+  apply();
+})();
+</script>
+<style>
+:root {
+  --bg: #fafafa;
+  --bg2: #f1f1f2;
+  --card: #ffffff;
+  --ink: #111112;
+  --ink2: #4a4a50;
+  --ink3: #85858c;
+  --line: #e4e4e7;
+  --btn: #111112;
+  --btn-ink: #fafafa;
+  --code: #f4f4f5;
+  --ok: #157f4b;
+  --ok-bg: rgba(21, 127, 75, 0.09);
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 12px 40px -12px rgba(0,0,0,.15);
+}
+:root[data-theme="dark"] {
+  --bg: #0b0b0c;
+  --bg2: #121214;
+  --card: #161618;
+  --ink: #f2f2f3;
+  --ink2: #b3b3ba;
+  --ink3: #7a7a82;
+  --line: #26262a;
+  --btn: #f2f2f3;
+  --btn-ink: #0b0b0c;
+  --code: #151517;
+  --ok: #3dd68c;
+  --ok-bg: rgba(61, 214, 140, 0.12);
+  --shadow: 0 1px 2px rgba(0,0,0,.3), 0 20px 60px -20px rgba(0,0,0,.8);
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei", "Noto Sans CJK SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: inherit; }
+code, pre, kbd { font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace; }
+.wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+/* Sticky Nav */
+nav {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: saturate(1.4) blur(14px);
+  -webkit-backdrop-filter: saturate(1.4) blur(14px);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  border-bottom: 1px solid transparent;
+  transition: border-color .2s;
+}
+nav.scrolled { border-bottom-color: var(--line); }
+nav .wrap { display: flex; align-items: center; gap: 22px; height: 56px; }
+.brand {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-weight: 680; font-size: 16.5px; letter-spacing: -.015em; text-decoration: none;
+}
+.brand svg { width: 21px; height: 21px; flex: none; }
+.brand .badge {
+  font-size: 11px; font-weight: 560; padding: 1px 7px; border-radius: 999px;
+  background: var(--bg2); border: 1px solid var(--line); color: var(--ink2);
+}
+nav .links { display: flex; gap: 22px; margin-left: auto; font-size: 13.5px; color: var(--ink2); }
+nav .links a { text-decoration: none; transition: color .15s; }
+nav .links a:hover { color: var(--ink); }
+.nav-actions { display: flex; align-items: center; gap: 8px; }
+.theme {
+  display: inline-grid; place-items: center; min-width: 32px; height: 32px;
+  padding: 0 8px; border-radius: 8px; border: 1px solid var(--line);
+  background: transparent; color: var(--ink2); cursor: pointer; font: inherit; font-size: 12px; font-weight: 580;
+  text-decoration: none;
+}
+.theme:hover { color: var(--ink); border-color: var(--ink3); }
+.theme svg { width: 15px; height: 15px; display: none; }
+.theme.gh svg { display: block; }
+.theme[data-mode="system"] .i-system,
+.theme[data-mode="light"] .i-light,
+.theme[data-mode="dark"] .i-dark { display: block; }
+.btn {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 0 14px; height: 32px; border-radius: 8px;
+  background: var(--btn); color: var(--btn-ink);
+  text-decoration: none; font-weight: 560; font-size: 13px;
+  white-space: nowrap; border: 1px solid var(--btn);
+  transition: transform .12s, opacity .12s; cursor: pointer;
+}
+.btn:hover { opacity: .88; }
+
+/* 1. FIRST SCREEN: Compact Header + Pack Animation Stage */
+.first-screen { padding: 14px 0 8px; }
+.hero-top {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.hero-title-group { max-width: 760px; }
+.concept-pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--ink2); background: var(--card);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 2.5px 11px 2.5px 8px; margin-bottom: 8px;
+}
+.concept-pill .tag-dot { width: 6.5px; height: 6.5px; border-radius: 2px; background: var(--ink); }
+.concept-pill code { font-size: 11.5px; font-weight: 650; color: var(--ink); }
+.hero-top h1 {
+  font-size: clamp(26px, 3.3vw, 36px);
+  line-height: 1.12; letter-spacing: -.03em; font-weight: 720; margin: 0 0 6px;
+}
+.hero-top h1 span { color: var(--ink3); font-weight: 640; }
+.hero-top p.lede {
+  margin: 0; font-size: 14.5px; color: var(--ink2); line-height: 1.54;
+}
+.hero-top p.lede b { color: var(--ink); font-weight: 600; }
+.hero-top p.lede code { font-size: 12.5px; background: var(--code); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+.hero-badges {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 5px;
+  font-size: 11.5px; color: var(--ink3); font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.hero-badges .formula {
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: 5px 10px; color: var(--ink2); font-size: 11.5px; white-space: nowrap;
+}
+.hero-badges .formula b { color: var(--ink); }
+
+/* Pack Workbench Stage Card */
+.pk {
+  background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+  box-shadow: var(--shadow); padding: 14px 18px 13px;
+}
+.pk-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px 12px; flex-wrap: wrap; margin-bottom: 10px;
+}
+.pk-tabs {
+  display: inline-flex; gap: 2px; padding: 3px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 10px;
+  max-width: 100%; overflow-x: auto;
+}
+.pk-tabs button {
+  font: inherit; font-size: 12.5px; border: 0; background: none; color: var(--ink2);
+  padding: 5px 10px; border-radius: 7px; cursor: pointer; white-space: nowrap;
+}
+.pk-tabs button:hover { color: var(--ink); }
+.pk-tabs button[aria-selected="true"] {
+  background: var(--card); color: var(--ink); font-weight: 580;
+  box-shadow: 0 0 0 1px var(--line), 0 1px 2px rgb(0 0 0 / .08);
+}
+.pk-cmd-bar {
+  width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--code); border: 1px solid var(--line); border-radius: 10px;
+  padding: 7px 13px; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px;
+  margin-bottom: 12px; overflow-x: auto; white-space: nowrap;
+}
+.pk-cmd-bar .prompt { color: var(--ink3); margin-right: 4px; }
+.pk-cmd-bar .kw { font-weight: 650; color: var(--ink); }
+.pk-cmd-bar .src-arg { text-decoration: underline; text-decoration-color: var(--ink3); text-underline-offset: 3px; }
+.pk-cmd-bar .dst-arg { font-weight: 600; }
+.pk-cmd-tag {
+  font-size: 11px; padding: 2px 8px; border-radius: 5px;
+  background: var(--card); border: 1px solid var(--line); color: var(--ink2); flex: none;
+}
+
+/* 3-Column Pack Workbench:
+   Col 1: Source Pack (Selector + Raw Source Container Tree)
+   Col 2: Normalized Pack (typship-pack Materialized Tree)
+   Col 3: Dest Pack (Selector + Atomic Destination Container Tree) */
+.pk-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 44px minmax(0, 1fr) 44px minmax(0, 1fr);
+  gap: 8px;
+  align-items: stretch;
+  padding: 2px 0 12px;
+}
+.pk-zone {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0;
+}
+.pk-zone-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  font-size: 11px; font-weight: 650; letter-spacing: .05em; text-transform: uppercase; color: var(--ink3);
+}
+.pk-zone-head span:last-child {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-weight: 500; text-transform: none; letter-spacing: 0; font-size: 11px; color: var(--ink2);
+}
+.pk-pills {
+  display: flex; flex-wrap: wrap; gap: 4.5px;
+}
+.pk-pills button {
+  font: 550 11.5px/1.35 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--card); color: var(--ink2); cursor: pointer;
+  transition: border-color .18s, background .18s, color .18s;
+}
+.pk-pills button:hover { border-color: var(--ink3); color: var(--ink); }
+.pk-pills button.on {
+  background: var(--ink); color: var(--card); border-color: var(--ink);
+}
+.pk-mid-note {
+  font-size: 11.5px; color: var(--ink2); background: var(--card); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 9px; line-height: 1.42;
+}
+.pk-mid-note b { color: var(--ink); font-weight: 620; }
+
+/* The Pack Container Card inside each Zone */
+.pk-box {
+  background: var(--card); border: 1.5px solid var(--line); border-radius: 11px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 7px; flex: 1;
+  transition: border-color .25s, box-shadow .25s;
+}
+.pk-box.focus {
+  border-color: var(--ink);
+  box-shadow: 0 0 0 3px var(--bg2), var(--shadow);
+}
+.pk-box.staging {
+  border-style: dashed;
+}
+.pk-box-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  padding-bottom: 6px; border-bottom: 1px solid var(--line);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
+}
+.pk-box-head b { color: var(--ink); font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pk-box-head span {
+  font-size: 10.5px; padding: 1.5px 6px; border-radius: 4px;
+  background: var(--code); color: var(--ink2); white-space: nowrap; flex: none;
+}
+.pk-box.focus .pk-box-head span { background: var(--ink); color: var(--card); }
+
+/* File Tree Items inside a Pack */
+.pk-tree {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 5px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+}
+.pk-tree li {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4.5px 8px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line);
+  color: var(--ink); transition: opacity .25s, border-color .25s;
+}
+.pk-tree li .fname {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pk-tree li .ftag {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 4px;
+  background: var(--card); border: 1px solid var(--line); color: var(--ink3); white-space: nowrap; flex: none;
+}
+.pk-tree li.stripped {
+  opacity: .46; text-decoration: line-through; border-style: dashed;
+}
+.pk-tree li.manifest {
+  border-color: color-mix(in srgb, var(--ink) 40%, var(--line));
+  font-weight: 600;
+}
+.pk-tree li.manifest .ftag {
+  color: var(--ink); font-weight: 600;
+}
+.pk-tree li.weaker-note {
+  background: var(--code); border-style: dashed; color: var(--ink2); font-size: 11.5px;
+}
+.pk-box-foot {
+  margin-top: auto; padding-top: 7px; border-top: 1px dashed var(--line);
+  font-size: 11px; color: var(--ink2); display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+}
+.pk-box-foot .ok-badge {
+  color: var(--ok); background: var(--ok-bg); padding: 1.5px 6px; border-radius: 4px; font-weight: 600; white-space: nowrap;
+}
+
+.pk-bridge {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
+  color: var(--ink3); font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 10.5px;
+}
+.pk-bridge .arrow-circle {
+  width: 30px; height: 30px; border-radius: 50%; border: 1px solid var(--line);
+  background: var(--bg); display: grid; place-items: center; transition: border-color .25s, background .25s, color .25s, transform .25s;
+}
+.pk-bridge svg { width: 15px; height: 15px; }
+.pk-bridge.on { color: var(--ink); font-weight: 600; }
+.pk-bridge.on .arrow-circle {
+  border-color: var(--ink); background: var(--ink); color: var(--card); transform: scale(1.06);
+}
+
+/* Foot Caption & Pack Metadata */
+.pk-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px 20px; flex-wrap: wrap; padding-top: 11px; border-top: 1px solid var(--line);
+}
+.pk-cap {
+  flex: 1 1 26em; margin: 0; font-size: 13.5px; color: var(--ink);
+}
+.pk-meta-pills {
+  display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--ink3);
+}
+.pk-meta-pills span { display: flex; align-items: center; gap: 6px; }
+.pk-meta-pills b {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px;
+  color: var(--ink); background: var(--bg2); border: 1px solid var(--line);
+  padding: 2px 7px; border-radius: 6px; font-weight: 580;
+}
+
+/* Sections 2, 3, 4 */
+section { padding: 72px 0 0; scroll-margin-top: 64px; }
+.eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink3); margin: 0 0 8px; font-weight: 620; }
+h2 { font-size: clamp(26px, 3.4vw, 36px); line-height: 1.14; letter-spacing: -.025em; margin: 0 0 12px; font-weight: 690; }
+.sub { font-size: 16px; color: var(--ink2); max-width: 42em; margin: 0 0 28px; }
+.sub code { font-size: 13.5px; background: var(--code); padding: 1px 5px; border-radius: 4px; color: var(--ink); }
+
+/* 2. SECOND SCREEN: Typship Features (Dynamic CLI Execution Carousel) */
+@keyframes blink { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }
+@keyframes lineIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+
+.fc {
+  background: var(--card); border: 1px solid var(--line); border-radius: 18px;
+  box-shadow: var(--shadow); padding: 16px 18px 16px;
+}
+.fc-tabs {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px;
+  margin-bottom: 14px;
+}
+.fc-tab {
+  position: relative; text-align: left; padding: 11px 13px 13px;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  cursor: pointer; font: inherit; color: var(--ink2); overflow: hidden;
+  transition: border-color .2s, background .2s, box-shadow .2s;
+}
+.fc-tab:hover { border-color: var(--ink3); color: var(--ink); }
+.fc-tab[aria-selected="true"] {
+  background: var(--card); border-color: var(--ink); color: var(--ink);
+  box-shadow: 0 0 0 2px var(--bg2);
+}
+.fc-tab-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px; margin-bottom: 4px;
+}
+.fc-tab-top b { font-size: 13.5px; font-weight: 650; color: var(--ink); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fc-tab-top code {
+  font-size: 11px; padding: 1px 6px; border-radius: 5px;
+  background: var(--code); border: 1px solid var(--line); color: var(--ink2); white-space: nowrap;
+}
+.fc-tab[aria-selected="true"] .fc-tab-top code {
+  background: var(--ink); color: var(--card); border-color: var(--ink);
+}
+.fc-tab small {
+  display: block; font-size: 12px; color: var(--ink2); line-height: 1.4;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.fc-tab-progress {
+  position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: transparent;
+}
+.fc-tab-progress i {
+  display: block; height: 100%; width: 0%; background: var(--ink);
+  transition: width .12s linear;
+}
+
+.fc-stage {
+  display: grid; grid-template-columns: minmax(0, 1.28fr) minmax(0, .72fr); gap: 14px;
+  align-items: stretch;
+}
+.fc-term {
+  background: var(--code); border: 1px solid var(--line); border-radius: 14px;
+  display: flex; flex-direction: column; overflow: hidden; min-height: 310px;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+.fc-term-bar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 8px 14px; border-bottom: 1px solid var(--line);
+  background: color-mix(in srgb, var(--bg2) 75%, var(--code));
+  font-size: 11.5px; color: var(--ink3);
+}
+.fc-term-left { display: flex; align-items: center; gap: 10px; }
+.term-dots { display: flex; gap: 5px; }
+.term-dots i { width: 8px; height: 8px; border-radius: 50%; background: var(--line); display: block; }
+.fc-term-actions { display: flex; align-items: center; gap: 8px; }
+.fc-btn {
+  font: 550 11px/1 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 4px 8px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--card); color: var(--ink2); cursor: pointer;
+}
+.fc-btn:hover { color: var(--ink); border-color: var(--ink3); }
+.fc-term-body {
+  padding: 14px 16px; font-size: 12.5px; line-height: 1.68; color: var(--ink);
+  flex: 1; overflow-x: auto;
+}
+.fc-line {
+  white-space: pre-wrap; word-break: break-all; margin-bottom: 2px;
+  animation: lineIn .16s ease-out;
+}
+.fc-line .p { color: var(--ink3); user-select: none; margin-right: 6px; }
+.fc-line .cmd { font-weight: 650; color: var(--ink); }
+.fc-line .comment { color: var(--ink3); }
+.fc-line .step { color: var(--ink2); }
+.fc-line .out { color: var(--ink2); }
+.fc-line .ok { color: var(--ok); font-weight: 600; }
+.fc-line .err { color: #d9534f; font-weight: 600; }
+.fc-cursor {
+  display: inline-block; width: 7px; height: 14px; vertical-align: -2px;
+  background: var(--ink); margin-left: 2px; animation: blink .9s infinite;
+}
+
+/* Right Side of Feature Stage: Live Execution State & File Tree Inspector */
+.fc-side {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 14px;
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; min-width: 0;
+}
+.fc-side-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--line);
+}
+.fc-side-head b { font-size: 13px; font-weight: 650; color: var(--ink); }
+.fc-side-head span {
+  font: 550 11px/1.3 ui-monospace, "SF Mono", Menlo, monospace;
+  padding: 2px 7px; border-radius: 999px; background: var(--card); border: 1px solid var(--line); color: var(--ink2);
+}
+.fc-side-desc { margin: 0; font-size: 13px; color: var(--ink2); line-height: 1.5; }
+.fc-fs-box {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 10px 12px; flex: 1; display: flex; flex-direction: column; gap: 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
+}
+.fc-fs-title {
+  font-size: 11px; color: var(--ink3); display: flex; justify-content: space-between;
+  padding-bottom: 5px; border-bottom: 1px dashed var(--line);
+}
+.fc-fs-list {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 5px;
+}
+.fc-fs-list li {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 4.5px 8px; border-radius: 6px; background: var(--bg); border: 1px solid var(--line);
+  animation: lineIn .2s ease-out;
+}
+.fc-fs-list li.highlight {
+  border-color: var(--ink); font-weight: 600;
+}
+.fc-fs-list li .tag {
+  font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: var(--card); border: 1px solid var(--line); color: var(--ink2); white-space: nowrap;
+}
+.fc-fs-list li .tag.ok {
+  color: var(--ok); background: var(--ok-bg); border-color: transparent; font-weight: 600;
+}
+
+/* 3. THIRD SCREEN: Installation */
+.install-card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  padding: 24px 26px; display: grid; grid-template-columns: minmax(0, 1.18fr) minmax(0, .82fr); gap: 24px; align-items: center;
+}
+.install-box {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--code); border: 1px solid var(--line); border-radius: 11px;
+  padding: 6px 6px 6px 14px; margin: 12px 0 10px;
+}
+.install-box code { flex: 1; font-size: 13px; overflow-x: auto; white-space: nowrap; }
+.install-box code::before { content: "$ "; color: var(--ink3); }
+.copy {
+  flex: none; height: 32px; padding: 0 12px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--card); color: var(--ink);
+  font: inherit; font-size: 12.5px; cursor: pointer;
+}
+.copy:hover { border-color: var(--ink3); }
+.install-meta { font-size: 13px; color: var(--ink3); margin: 0; line-height: 1.55; }
+.install-alt {
+  background: var(--bg); border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px 16px; font-size: 13px; color: var(--ink2);
+}
+.install-alt b { display: block; color: var(--ink); margin-bottom: 6px; font-size: 13.5px; }
+.install-alt pre {
+  margin: 0; font-size: 12px; line-height: 1.65; color: var(--ink); overflow-x: auto;
+}
+
+/* 4. FOURTH SCREEN: Further Reading (Navigate to Guide) */
+.guide-grid {
+  display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px;
+}
+.guide-link {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 18px 20px; background: var(--card); border: 1px solid var(--line);
+  border-radius: 14px; text-decoration: none;
+  transition: border-color .2s, box-shadow .2s, transform .15s;
+}
+.guide-link:hover {
+  border-color: var(--ink); box-shadow: var(--shadow); transform: translateY(-1px);
+}
+.guide-link b { display: block; font-size: 15.5px; font-weight: 640; margin-bottom: 4px; color: var(--ink); }
+.guide-link span { display: block; font-size: 13.5px; color: var(--ink2); line-height: 1.5; }
+.guide-link i {
+  flex: none; font-style: normal; font-size: 18px; color: var(--ink3);
+  transition: transform .2s, color .2s;
+}
+.guide-link:hover i { color: var(--ink); transform: translateX(3px); }
+
+footer {
+  margin-top: 64px; border-top: 1px solid var(--line);
+  padding: 24px 0 36px; font-size: 13px; color: var(--ink3);
+}
+footer .wrap { display: flex; flex-wrap: wrap; gap: 12px 24px; align-items: center; }
+footer .links { margin-left: auto; display: flex; gap: 18px; }
+footer a { text-decoration: none; }
+footer a:hover { color: var(--ink); }
+
+@media (max-width: 960px) {
+  .pk-workbench, .fc-stage, .install-card, .guide-grid { grid-template-columns: 1fr; }
+  .fc-tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pk-bridge { transform: rotate(90deg); padding: 4px 0; }
+  nav .links { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav id="nav"><div class="wrap">
+  <a class="brand" href="#">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 2.5 3.5 7v10L12 21.5l8.5-4.5V7L12 2.5Z"/>
+      <path d="M3.5 7 12 11.5 20.5 7"/>
+      <path d="M12 11.5v10"/>
+      <path d="m7.8 4.8 8.4 4.5"/>
+    </svg>
+    typship
+    <span class="badge">Pack CLI</span>
+  </a>
+  <div class="links">
+    <a href="#pack-stage" data-i18n="nav.pack">Pack 演示</a>
+    <a href="#features" data-i18n="nav.features">CLI 特性</a>
+    <a href="#install" data-i18n="nav.install">安装</a>
+    <a href="guide.html" data-i18n="nav.guide">指南 (Guide) →</a>
+  </div>
+  <div class="nav-actions">
+    <button class="theme" id="lang-btn" type="button" title="Switch language">EN</button>
+    <a class="theme gh" href="https://github.com/Myriad-Dreamin/typship" target="_blank" rel="noopener" aria-label="typship on GitHub" title="GitHub">
+      <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+    </a>
+    <button class="theme" data-theme-btn type="button" aria-label="Theme" title="Theme: system">
+      <svg class="i-system" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="1.75" y="2.75" width="12.5" height="8.5" rx="1.5"/><path d="M5.5 14h5M8 11.25V14"/></svg>
+      <svg class="i-light" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="3"/><path d="M8 1v1.5M8 13.5V15M1 8h1.5M13.5 8H15M3 3l1 1M12 12l1 1M3 13l1-1M12 4l1-1"/></svg>
+      <svg class="i-dark" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M13.5 9.5A5.5 5.5 0 0 1 6.5 2.5a5.5 5.5 0 1 0 7 7Z"/></svg>
+    </button>
+    <a class="btn" href="#install" data-i18n="nav.get">安装</a>
+  </div>
+</div></nav>
+
+<main class="wrap">
+  <!-- 1. FIRST SCREEN: Compact Intro + Pack Structure Transformation Stage -->
+  <div class="first-screen" id="pack-stage">
+    <div class="hero-top">
+      <div class="hero-title-group">
+        <div class="concept-pill">
+          <span class="tag-dot"></span>
+          <span data-i18n="hero.pill">提出 <code>Pack</code> 概念 —— A concept weaker than a package</span>
+        </div>
+        <h1 data-i18n="hero.h1">比 Package 更轻的 Pack，<span>在任意形态间自由拆装。</span></h1>
+        <p class="lede" data-i18n="hero.lede">
+          正式的 Typst <b>Package</b> 要求完备的 <code>typst.toml</code> 与 <code>@ns/name:ver</code> 注册身份；而 <b>Pack</b> 是比它更弱的概念——无论是一棵尚未编写清单的本地草稿目录、GitHub 仓库里的某个模板子目录、<code>.tar.gz</code> 归档，还是 <code>@preview</code> 注册表包，都是一个 <b>Pack</b>。<b>typship</b> 按形状识别源容器与目标容器，自动剥离外壳、定位包根并原子落盘。
+        </p>
+      </div>
+      <div class="hero-badges">
+        <div class="formula"><b>Pack</b> ⊃ <b>Package</b> · <span data-i18n="hero.f1">清单可选 · 形状直达</span></div>
+        <div class="formula"><span data-i18n="hero.f2">Source Pack 容器 → 归一化 Pack 文件树 → Dest Pack 容器</span></div>
+      </div>
+    </div>
+
+    <!-- Interactive Pack Transformation Stage -->
+    <div class="pk" id="pk">
+      <div class="pk-top">
+        <div class="pk-tabs" role="tablist" aria-label="Pack Scenarios">
+          <button role="tab" data-preset="0" aria-selected="true" data-i18n="tab.0">1. GitHub 子目录 → 本地目录</button>
+          <button role="tab" data-preset="1" aria-selected="false" data-i18n="tab.1">2. 无清单目录 (Weaker Pack) → .tar.gz</button>
+          <button role="tab" data-preset="2" aria-selected="false" data-i18n="tab.2">3. @preview 包 → 本地目录</button>
+          <button role="tab" data-preset="3" aria-selected="false" data-i18n="tab.3">4. 本地 Pack → GitHub Release</button>
+          <button role="tab" data-preset="4" aria-selected="false" data-i18n="tab.4">5. 本地目录 ⇢ 符号链接 (link)</button>
+        </div>
+      </div>
+
+      <div class="pk-cmd-bar">
+        <div>
+          <span class="prompt">$</span>
+          <span class="kw" id="pk-cmd-kw">typship copy</span>
+          <span class="src-arg" id="pk-cmd-src">github.com/typst/templates/tree/main/charged-ieee</span>
+          <span class="dst-arg" id="pk-cmd-dst">./ieee</span>
+        </div>
+        <span class="pk-cmd-tag" id="pk-cmd-tag">GithubTree → Dir</span>
+      </div>
+
+      <div class="pk-workbench">
+        <!-- Zone 1: Source Pack (Selector + Raw Source Container Tree) -->
+        <div class="pk-zone">
+          <div class="pk-zone-head">
+            <span data-i18n="step.1">① SOURCE PACK · 源容器</span>
+            <span id="pill-step-1-sub">parse_source</span>
+          </div>
+          <div class="pk-pills" id="pk-src-list"></div>
+          <div class="pk-box" id="box-src">
+            <div class="pk-box-head">
+              <b id="box-src-title">templates.git (tree/main)</b>
+              <span id="box-src-badge">Source::GithubTree</span>
+            </div>
+            <ul class="pk-tree" id="tree-src"></ul>
+            <div class="pk-box-foot">
+              <span id="box-src-foot-l">shallow clone ref=main</span>
+              <span id="box-src-foot-r">locate_subdir</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pk-bridge" id="bridge-1">
+          <div class="arrow-circle">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8h11M9.5 4l4 4-4 4"/></svg>
+          </div>
+          <span id="bridge-1-txt">extract</span>
+        </div>
+
+        <!-- Zone 2: Normalized Pack (The Core Concept: Weaker than Package!) -->
+        <div class="pk-zone">
+          <div class="pk-zone-head">
+            <span data-i18n="step.2">② NORMALIZED PACK · 归一化</span>
+            <span id="pill-step-2-sub">materialize</span>
+          </div>
+          <div class="pk-mid-note" id="pk-mid-note">
+            <b>typship-pack：</b>剥离外层包装，定位 <code>typst.toml</code> 包根；无清单亦作为合法 Pack 保留原结构。
+          </div>
+          <div class="pk-box" id="box-pack">
+            <div class="pk-box-head">
+              <b id="box-pack-title">Pack · charged-ieee</b>
+              <span id="box-pack-badge">Materialized::Dir</span>
+            </div>
+            <ul class="pk-tree" id="tree-pack"></ul>
+            <div class="pk-box-foot">
+              <span id="box-pack-foot-l">UTF-8 · no .. · no symlink</span>
+              <span class="ok-badge" id="box-pack-foot-r">Pack Ready</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="pk-bridge" id="bridge-2">
+          <div class="arrow-circle">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M2.5 8h11M9.5 4l4 4-4 4"/></svg>
+          </div>
+          <span id="bridge-2-txt">place</span>
+        </div>
+
+        <!-- Zone 3: Destination Pack (Selector + Atomic Destination Container Tree) -->
+        <div class="pk-zone">
+          <div class="pk-zone-head">
+            <span data-i18n="step.3">③ DEST PACK · 目标容器</span>
+            <span id="pill-step-3-sub">atomic place</span>
+          </div>
+          <div class="pk-pills" id="pk-dst-list"></div>
+          <div class="pk-box" id="box-dst">
+            <div class="pk-box-head">
+              <b id="box-dst-title">./ieee/</b>
+              <span id="box-dst-badge">Dest::Dir</span>
+            </div>
+            <ul class="pk-tree" id="tree-dst"></ul>
+            <div class="pk-box-foot">
+              <span id="box-dst-foot-l">TempDir::next_to</span>
+              <span class="ok-badge" id="box-dst-foot-r">✓ atomic rename</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pk-foot">
+        <p class="pk-cap" id="pk-cap">
+          ① 浅克隆仓库并剥离 .git 与外层目录 → ② 提取子目录 charged-ieee 形成干净的 Pack 文件树 → ③ 在 ./ieee 旁建临时目录解包并一次 rename 原子到位。
+        </p>
+        <div class="pk-meta-pills">
+          <span><span data-i18n="meta.m1">清单约束</span> <b id="meta-manifest">含 typst.toml (自动定位包根)</b></span>
+          <span><span data-i18n="meta.m2">安全校验</span> <b>UTF-8 · 严拒 .. 与 symlink</b></span>
+          <span><span data-i18n="meta.m3">原子保障</span> <b id="meta-atomic">同挂载点临时目录 + rename</b></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 2. SECOND SCREEN: Typship Features (Dynamic CLI Execution Carousel) -->
+  <section id="features">
+    <p class="eyebrow" data-i18n="f.eyebrow">核心特性 · TYPSHIP FEATURES</p>
+    <h2 data-i18n="f.h2">四个命令，动态演示完整的 CLI 执行过程。</h2>
+    <p class="sub" data-i18n="f.sub">
+      <code>typship</code> 围绕 <code>Pack</code> 抽象提供四个正交子命令：<code>init</code>、<code>copy</code>、<code>link</code> 与 <code>download</code>。下方自动轮播各特性的终端执行过程与实时文件系统变化，也可随时点选切换：
+    </p>
+
+    <div class="fc" id="fc">
+      <div class="fc-tabs" role="tablist" aria-label="CLI Features">
+        <button class="fc-tab" role="tab" type="button" data-feat="0" aria-selected="true">
+          <div class="fc-tab-top">
+            <b data-i18n="fc.0.t">1. 初始化包骨架</b>
+            <code>init</code>
+          </div>
+          <small data-i18n="fc.0.s">生成 typst.toml · 非空目录保护</small>
+          <div class="fc-tab-progress"><i></i></div>
+        </button>
+
+        <button class="fc-tab" role="tab" type="button" data-feat="1" aria-selected="false">
+          <div class="fc-tab-top">
+            <b data-i18n="fc.1.t">2. 跨源拉取解包</b>
+            <code>copy → Dir</code>
+          </div>
+          <small data-i18n="fc.1.s">分支试探 · 定位包根 · 原子 rename</small>
+          <div class="fc-tab-progress"><i></i></div>
+        </button>
+
+        <button class="fc-tab" role="tab" type="button" data-feat="2" aria-selected="false">
+          <div class="fc-tab-top">
+            <b data-i18n="fc.2.t">3. 打包与发版</b>
+            <code>Tar · Release</code>
+          </div>
+          <small data-i18n="fc.2.s">排序 ustar (mtime=0) · Release 上传</small>
+          <div class="fc-tab-progress"><i></i></div>
+        </button>
+
+        <button class="fc-tab" role="tab" type="button" data-feat="3" aria-selected="false">
+          <div class="fc-tab-top">
+            <b data-i18n="fc.3.t">4. 软链与缓存</b>
+            <code>link · cache</code>
+          </div>
+          <small data-i18n="fc.3.s">本地目录 symlink · 远端降级 · 缓存</small>
+          <div class="fc-tab-progress"><i></i></div>
+        </button>
+      </div>
+
+      <div class="fc-stage">
+        <!-- Left: Dynamic CLI Execution Terminal -->
+        <div class="fc-term">
+          <div class="fc-term-bar">
+            <div class="fc-term-left">
+              <div class="term-dots"><i></i><i></i><i></i></div>
+              <span id="fc-term-title">typship init · crates/typship/src/manifest.rs</span>
+            </div>
+            <div class="fc-term-actions">
+              <button class="fc-btn" id="fc-pause-btn" type="button">暂停轮播</button>
+              <button class="fc-btn" id="fc-replay-btn" type="button" data-i18n="fc.replay">↻ 重播当前</button>
+            </div>
+          </div>
+          <div class="fc-term-body" id="fc-term-body"></div>
+        </div>
+
+        <!-- Right: Synchronized Filesystem & State Inspector -->
+        <div class="fc-side">
+          <div class="fc-side-head">
+            <b id="fc-side-title" data-i18n="fc.side.title">实时落盘状态 · File Tree</b>
+            <span id="fc-side-badge">Running…</span>
+          </div>
+          <p class="fc-side-desc" id="fc-side-desc"></p>
+          <div class="fc-fs-box">
+            <div class="fc-fs-title">
+              <span id="fc-fs-path">/work/my-notes/</span>
+              <span id="fc-fs-status">0 items</span>
+            </div>
+            <ul class="fc-fs-list" id="fc-fs-list"></ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3. THIRD SCREEN: Installation -->
+  <section id="install">
+    <p class="eyebrow" data-i18n="ins.eyebrow">安装 · INSTALLATION</p>
+    <h2 data-i18n="ins.h2">从 Git 仓库一键安装。</h2>
+    <div class="install-card">
+      <div>
+        <div style="font-size:15px; font-weight:620; color:var(--ink);" data-i18n="ins.cargo">使用 Cargo 直接安装当前主线版本：</div>
+        <div class="install-box">
+          <code id="install-cmd">cargo install --git https://github.com/Myriad-Dreamin/typship typship</code>
+          <button class="copy" type="button" data-copy="install-cmd" data-i18n="copy">复制</button>
+        </div>
+        <p class="install-meta" data-i18n="ins.note">
+          需要 Rust 1.85+（Edition 2024）。注：crates.io 上已发布的 <code>typship 0.1.0–0.4.2</code> 为早期旧线，当前基于 <code>typship-pack</code> 的重构版本尚未发布至 crates.io，请通过 <code>--git</code> 或源码安装。
+        </p>
+      </div>
+      <div class="install-alt">
+        <b data-i18n="ins.src">或克隆仓库本地构建与测试：</b>
+        <pre>git clone https://github.com/Myriad-Dreamin/typship.git
+cd typship
+cargo build --release
+cargo test --workspace</pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. FOURTH SCREEN: Further Reading (Navigate to Guide) -->
+  <section id="further-reading">
+    <p class="eyebrow" data-i18n="fr.eyebrow">延伸阅读 · FURTHER READING</p>
+    <h2 data-i18n="fr.h2">深入了解 Pack 规范与架构指南。</h2>
+    <p class="sub" data-i18n="fr.sub">
+      前往完整指南页面，查阅所有源/目标形状匹配优先级、安全解包白名单与双 Crate 模块设计。
+    </p>
+    <div class="guide-grid">
+      <a class="guide-link" href="guide.html#pack-concept">
+        <div>
+          <b data-i18n="fr.1.h">Pack 概念与设计边界</b>
+          <span data-i18n="fr.1.p">为什么提出比 Package 更弱的 Pack 概念？详解有清单与无清单目录树的统一处理规则。</span>
+        </div>
+        <i aria-hidden="true">→</i>
+      </a>
+      <a class="guide-link" href="guide.html#shape-matrix">
+        <div>
+          <b data-i18n="fr.2.h">Source &amp; Dest 形状完整速查表</b>
+          <span data-i18n="fr.2.p">10 种 Source Pack 输入形状与 3 类 Destination Pack 的解析优先级、子路径提取与命名规则。</span>
+        </div>
+        <i aria-hidden="true">→</i>
+      </a>
+      <a class="guide-link" href="guide.html#security-atomicity">
+        <div>
+          <b data-i18n="fr.3.h">解包安全、确定性归档与原子落盘</b>
+          <span data-i18n="fr.3.p">Typst 对齐的归档成员校验、同挂载点 TempDir::next_to + rename 以及 HTTP/Git 超时红线。</span>
+        </div>
+        <i aria-hidden="true">→</i>
+      </a>
+      <a class="guide-link" href="guide.html#architecture">
+        <div>
+          <b data-i18n="fr.4.h">Workspace 双 Crate 架构指南</b>
+          <span data-i18n="fr.4.p">crates/typship (CLI) 与 crates/typship-pack (Named Pack 核心库) 的模块职责与开发规范。</span>
+        </div>
+        <i aria-hidden="true">→</i>
+      </a>
+    </div>
+  </section>
+</main>
+
+<footer><div class="wrap">
+  <span>© 2026 typship contributors · MIT License</span>
+  <span>Pack: a concept weaker than package.</span>
+  <div class="links">
+    <a href="guide.html" data-i18n="nav.guide">指南 (Guide)</a>
+    <a href="https://github.com/Myriad-Dreamin/typship" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</div></footer>
+
+<script id="app-script">
+(() => {
+  const nav = document.getElementById("nav");
+  const nextTheme = { system: "light", light: "dark", dark: "system" };
+  document.querySelectorAll("button.theme[data-theme-btn]").forEach((b) => {
+    b.dataset.mode = window.themeMode();
+    b.title = window.themeTitle(window.themeMode());
+    b.addEventListener("click", () => window.setTheme(nextTheme[window.themeMode()]));
+  });
+
+  const onScroll = () => nav.classList.toggle("scrolled", window.scrollY > 8);
+  window.addEventListener("scroll", onScroll, { passive: true });
+  onScroll();
+
+  document.querySelectorAll(".copy").forEach((b) =>
+    b.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(document.getElementById(b.dataset.copy).textContent);
+        b.textContent = window.T("已复制", "Copied");
+        setTimeout(() => (b.textContent = window.T("复制", "Copy")), 1400);
+      } catch {}
+    })
+  );
+
+  // 6 Source Pack shapes
+  const SOURCES = [
+    {
+      id: "tree",
+      code: "github.com/…/tree/ref/sub",
+      kind: "GithubTree",
+      mat: "Materialized::Dir",
+      zhDesc: "含斜杠分支名试探 + 子目录定位",
+      enDesc: "Slash-ref probe + subdir locate",
+      srcArg: "https://github.com/typst/templates/tree/main/charged-ieee",
+      packName: "charged-ieee",
+      hasManifest: true,
+      rawTitle: "templates.git (tree/main)",
+      rawFootL: "shallow clone ref=main",
+      rawFootR: "locate_subdir",
+      rawTree: [
+        { name: ".git/", tag: "strip .git", cls: "stripped" },
+        { name: "other-template/", tag: "ignore", cls: "stripped" },
+        { name: "charged-ieee/typst.toml", tag: "pack root", cls: "manifest" },
+        { name: "charged-ieee/main.typ", tag: "file", cls: "" },
+        { name: "charged-ieee/ieee.typ", tag: "file", cls: "" },
+      ],
+      packTree: [
+        { name: "typst.toml", tag: "[package] charged-ieee", cls: "manifest" },
+        { name: "main.typ", tag: "UTF-8 · plain file", cls: "" },
+        { name: "ieee.typ", tag: "UTF-8 · plain file", cls: "" },
+      ],
+    },
+    {
+      id: "fs-raw",
+      code: "./draft-notes (无清单)",
+      kind: "Fs (Weaker Pack)",
+      mat: "Materialized::Dir",
+      zhDesc: "无需 typst.toml 的普通目录也是 Pack",
+      enDesc: "Dir without typst.toml is still a Pack",
+      srcArg: "./draft-notes",
+      packName: "draft-notes",
+      hasManifest: false,
+      rawTitle: "./draft-notes/",
+      rawFootL: "is_dir() ✓ · no symlink",
+      rawFootR: "raw tree pack",
+      rawTree: [
+        { name: "(no typst.toml)", tag: "Pack ⊃ Package", cls: "weaker-note" },
+        { name: "notes.typ", tag: "local file", cls: "" },
+        { name: "refs.bib", tag: "local file", cls: "" },
+        { name: "figs/plot.svg", tag: "subdir file", cls: "" },
+      ],
+      packTree: [
+        { name: "(无清单 · 原结构保留)", tag: "valid Pack", cls: "weaker-note" },
+        { name: "figs/plot.svg", tag: "no .. · no symlink", cls: "" },
+        { name: "notes.typ", tag: "no .. · no symlink", cls: "" },
+        { name: "refs.bib", tag: "no .. · no symlink", cls: "" },
+      ],
+    },
+    {
+      id: "reg",
+      code: "@preview/cetz:0.3.2",
+      kind: "Registry",
+      mat: "Materialized::Tarball",
+      zhDesc: "@preview · @local · --registry",
+      enDesc: "@preview · @local · --registry",
+      srcArg: "@preview/cetz:0.3.2",
+      packName: "cetz",
+      hasManifest: true,
+      rawTitle: "packages.typst.org/preview",
+      rawFootL: "GET cetz-0.3.2.tar.gz",
+      rawFootR: "MultiGzDecoder",
+      rawTree: [
+        { name: "index.json", tag: "resolve 0.3.2", cls: "stripped" },
+        { name: "cetz-0.3.2.tar.gz", tag: "gzip stream", cls: "" },
+        { name: "├─ typst.toml", tag: "manifest", cls: "manifest" },
+        { name: "├─ src/lib.typ", tag: "tar entry", cls: "" },
+        { name: "└─ src/canvas.typ", tag: "tar entry", cls: "" },
+      ],
+      packTree: [
+        { name: "typst.toml", tag: "cetz 0.3.2", cls: "manifest" },
+        { name: "src/canvas.typ", tag: "verified entry", cls: "" },
+        { name: "src/lib.typ", tag: "verified entry", cls: "" },
+      ],
+    },
+    {
+      id: "fs-pkg",
+      code: "./my-pack (含清单)",
+      kind: "Fs (Dir)",
+      mat: "Materialized::Dir",
+      zhDesc: "本地包目录 · 物理路径防嵌套",
+      enDesc: "Local pack dir · ensure_distinct",
+      srcArg: "./my-pack",
+      packName: "my-pack",
+      hasManifest: true,
+      rawTitle: "./my-pack/",
+      rawFootL: "ensure_distinct ✓",
+      rawFootR: "reject symlinks",
+      rawTree: [
+        { name: "typst.toml", tag: "name = \"my-pack\"", cls: "manifest" },
+        { name: "lib.typ", tag: "#import \"src/lib.typ\"", cls: "" },
+        { name: "src/lib.typ", tag: "module source", cls: "" },
+      ],
+      packTree: [
+        { name: "typst.toml", tag: "[package] my-pack", cls: "manifest" },
+        { name: "lib.typ", tag: "plain file ✓", cls: "" },
+        { name: "src/lib.typ", tag: "plain file ✓", cls: "" },
+      ],
+    },
+    {
+      id: "repo",
+      code: "github.com/o/r[.git]",
+      kind: "GithubRepo",
+      mat: "Materialized::Dir",
+      zhDesc: "浅克隆默认分支 · ≤3 层找包根",
+      enDesc: "Shallow clone · ≤3 level root search",
+      srcArg: "https://github.com/owner/typst-slides.git",
+      packName: "typst-slides",
+      hasManifest: true,
+      rawTitle: "github.com/owner/typst-slides",
+      rawFootL: "git clone --depth 1",
+      rawFootR: "find_pack_root",
+      rawTree: [
+        { name: ".git/", tag: "removed", cls: "stripped" },
+        { name: "typst-slides-main/", tag: "chain ≤3 unwrap", cls: "stripped" },
+        { name: "└─ typst.toml", tag: "pack root found", cls: "manifest" },
+        { name: "└─ slides.typ", tag: "file", cls: "" },
+      ],
+      packTree: [
+        { name: "typst.toml", tag: "root located", cls: "manifest" },
+        { name: "slides.typ", tag: "UTF-8 · plain file", cls: "" },
+      ],
+    },
+    {
+      id: "tar",
+      code: "pack.tar.gz · - · Release",
+      kind: "Tarball | Stdin | Release",
+      mat: "Materialized::Tarball",
+      zhDesc: "本地归档、stdin 管道或 Release 资产",
+      enDesc: "Local .tar.gz, stdin, or Release asset",
+      srcArg: "https://github.com/owner/pack/releases/latest",
+      packName: "pack",
+      hasManifest: true,
+      rawTitle: "releases/latest (.tar.gz asset)",
+      rawFootL: "API → browser_download_url",
+      rawFootR: "ustar validate",
+      rawTree: [
+        { name: "release.json", tag: "pick .tar.gz asset", cls: "stripped" },
+        { name: "pack-main/", tag: "single-dir chain", cls: "stripped" },
+        { name: "├─ typst.toml", tag: "pack root", cls: "manifest" },
+        { name: "└─ lib.typ", tag: "entry", cls: "" },
+      ],
+      packTree: [
+        { name: "typst.toml", tag: "pack root", cls: "manifest" },
+        { name: "lib.typ", tag: "verified member", cls: "" },
+      ],
+    },
+  ];
+
+  // 4 Destination Pack shapes
+  const DESTS = [
+    {
+      id: "dir",
+      code: "./ieee · ./vendor/…",
+      kind: "Dest::Dir",
+      zhDesc: "紧邻临时目录解包/拷贝 + 原子 rename",
+      enDesc: "Adjacent temp dir + atomic rename",
+    },
+    {
+      id: "tar",
+      code: "./dist/*.tar.gz",
+      kind: "Dest::Tarball",
+      zhDesc: "字典序 ustar (0644, mtime=0) 原子写",
+      enDesc: "Sorted ustar (0644, mtime=0) atomic write",
+    },
+    {
+      id: "rel",
+      code: "github.com/…/releases/{tag}",
+      kind: "Dest::Release",
+      zhDesc: "404 自动建 Release · 上传 .tar.gz 资产",
+      enDesc: "Create release on 404 · upload asset",
+    },
+    {
+      id: "link",
+      code: "link 软链 · download 缓存",
+      kind: "Symlink | Cache",
+      zhDesc: "本地目录建 symlink · 远端源自动降级 copy",
+      enDesc: "Local symlink · remote falls back to copy",
+    },
+  ];
+
+  // 5 Curated Presets matching the 5 top tabs
+  const PRESETS = [
+    { srcIdx: 0, dstIdx: 0 }, // 1. GitHub Tree -> Local Dir
+    { srcIdx: 1, dstIdx: 1 }, // 2. Manifest-less Dir (Weaker Pack) -> .tar.gz
+    { srcIdx: 2, dstIdx: 0 }, // 3. @preview/cetz:0.3.2 -> Local Dir
+    { srcIdx: 3, dstIdx: 2 }, // 4. Local Pack -> GitHub Release
+    { srcIdx: 3, dstIdx: 3 }, // 5. Local Pack -> Symlink (link)
+  ];
+
+  const srcListEl = document.getElementById("pk-src-list");
+  const dstListEl = document.getElementById("pk-dst-list");
+  const tabs = [...document.querySelectorAll(".pk-tabs button")];
+
+  const cmdKw = document.getElementById("pk-cmd-kw");
+  const cmdSrc = document.getElementById("pk-cmd-src");
+  const cmdDst = document.getElementById("pk-cmd-dst");
+  const cmdTag = document.getElementById("pk-cmd-tag");
+
+  const pill1Sub = document.getElementById("pill-step-1-sub");
+  const pill2Sub = document.getElementById("pill-step-2-sub");
+  const pill3Sub = document.getElementById("pill-step-3-sub");
+  const midNote = document.getElementById("pk-mid-note");
+
+  const boxSrc = document.getElementById("box-src");
+  const boxPack = document.getElementById("box-pack");
+  const boxDst = document.getElementById("box-dst");
+  const bridge1 = document.getElementById("bridge-1");
+  const bridge2 = document.getElementById("bridge-2");
+  const bridge1Txt = document.getElementById("bridge-1-txt");
+  const bridge2Txt = document.getElementById("bridge-2-txt");
+
+  const boxSrcTitle = document.getElementById("box-src-title");
+  const boxSrcBadge = document.getElementById("box-src-badge");
+  const treeSrc = document.getElementById("tree-src");
+  const boxSrcFootL = document.getElementById("box-src-foot-l");
+  const boxSrcFootR = document.getElementById("box-src-foot-r");
+
+  const boxPackTitle = document.getElementById("box-pack-title");
+  const boxPackBadge = document.getElementById("box-pack-badge");
+  const treePack = document.getElementById("tree-pack");
+  const boxPackFootL = document.getElementById("box-pack-foot-l");
+  const boxPackFootR = document.getElementById("box-pack-foot-r");
+
+  const boxDstTitle = document.getElementById("box-dst-title");
+  const boxDstBadge = document.getElementById("box-dst-badge");
+  const treeDst = document.getElementById("tree-dst");
+  const boxDstFootL = document.getElementById("box-dst-foot-l");
+  const boxDstFootR = document.getElementById("box-dst-foot-r");
+
+  const capEl = document.getElementById("pk-cap");
+  const metaManifest = document.getElementById("meta-manifest");
+  const metaAtomic = document.getElementById("meta-atomic");
+
+  let curSrc = 0;
+  let curDst = 0;
+  let stepTimer = null;
+  let autoCycleTimer = null;
+  let userPinned = false;
+  let presetIdx = 0;
+
+  const SRC_LABELS = [
+    ["tree/ref/sub", "tree/ref/sub"],
+    ["./draft (无清单)", "./draft (raw)"],
+    ["@preview/cetz", "@preview/cetz"],
+    ["./my-pack", "./my-pack"],
+    ["repo.git", "repo.git"],
+    ["tar.gz · - · Rel", "tar.gz · - · Rel"],
+  ];
+  const DST_LABELS = [
+    ["Dir 目录", "Dir"],
+    ["*.tar.gz 归档", "*.tar.gz"],
+    ["GitHub Release", "Release"],
+    ["link 软链", "link"],
+  ];
+
+  function renderSelectors() {
+    srcListEl.innerHTML = SOURCES.map(
+      (s, i) => `<button type="button" data-idx="${i}" class="${i === curSrc ? "on" : ""}" title="${window.T(s.zhDesc, s.enDesc)}">${window.T(SRC_LABELS[i][0], SRC_LABELS[i][1])}</button>`
+    ).join("");
+
+    dstListEl.innerHTML = DESTS.map(
+      (d, i) => `<button type="button" data-idx="${i}" class="${i === curDst ? "on" : ""}" title="${window.T(d.zhDesc, d.enDesc)}">${window.T(DST_LABELS[i][0], DST_LABELS[i][1])}</button>`
+    ).join("");
+
+    [...srcListEl.children].forEach((btn, i) => {
+      btn.addEventListener("click", () => {
+        userPinned = true;
+        selectPair(i, curDst, findMatchingPreset(i, curDst));
+      });
+    });
+
+    [...dstListEl.children].forEach((btn, i) => {
+      btn.addEventListener("click", () => {
+        userPinned = true;
+        selectPair(curSrc, i, findMatchingPreset(curSrc, i));
+      });
+    });
+  }
+
+  function findMatchingPreset(s, d) {
+    return PRESETS.findIndex((p) => p.srcIdx === s && p.dstIdx === d);
+  }
+
+  function renderTree(ul, items) {
+    ul.innerHTML = items
+      .map(
+        (it) => `<li class="${it.cls || ""}">
+          <span class="fname">${it.name}</span>
+          <span class="ftag">${it.tag}</span>
+        </li>`
+      )
+      .join("");
+  }
+
+  function computeDestSpec(s, dIdx) {
+    const pName = s.packName;
+    const realFiles = s.packTree.filter((f) => f.cls !== "weaker-note");
+    if (dIdx === 0) {
+      return {
+        cmd: "typship copy",
+        dstArg: `./${pName}`,
+        stagingTitle: `./.${pName}.typship-tmp/`,
+        finalTitle: `./${pName}/`,
+        badge: "Dest::Dir",
+        bridge: "rename",
+        stagingTree: realFiles.map((f) => ({
+          name: f.name,
+          tag: "staging…",
+          cls: f.cls,
+        })),
+        finalTree: realFiles.map((f) => ({
+          name: f.name,
+          tag: "placed ✓",
+          cls: f.cls,
+        })),
+        footL: "TempDir::next_to",
+        stagingFootR: "unpacking…",
+        finalFootR: "✓ atomic rename",
+        atomicText: window.T("同挂载点紧邻临时目录 + rename", "Adjacent temp dir + atomic rename"),
+        zhCap: `① 识别源容器 ${s.kind} → ② 剥离外层包装，提取 ${pName} 的 Pack 文件树 → ③ 在目标同挂载点紧邻建立临时目录完成解包/拷贝，一次 rename 原子落盘到 ./${pName}。`,
+        enCap: `① Detects ${s.kind} → ② Strips outer wrapper to form the clean ${pName} Pack file tree → ③ Stages in an adjacent temp dir on the same mount and atomically renames to ./${pName}.`,
+      };
+    }
+    if (dIdx === 1) {
+      return {
+        cmd: "typship copy",
+        dstArg: `./dist/${pName}.tar.gz`,
+        stagingTitle: `.${pName}.tar.gz.tmp`,
+        finalTitle: `./dist/${pName}.tar.gz`,
+        badge: "Dest::Tarball",
+        bridge: "ustar",
+        stagingTree: realFiles.map((f) => ({
+          name: f.name,
+          tag: "sorting · mtime=0",
+          cls: f.cls,
+        })),
+        finalTree: [
+          { name: `${pName}.tar.gz`, tag: "ustar · gzip", cls: "manifest" },
+          ...realFiles.slice(0, 3).map((f) => ({
+            name: `└─ ${f.name}`,
+            tag: "0644 · mtime 0",
+            cls: "",
+          })),
+        ],
+        footL: "walkdir sorted ustar",
+        stagingFootR: "packing…",
+        finalFootR: "✓ deterministic .tar.gz",
+        atomicText: window.T("字典序 ustar (mtime=0) + 临时文件原子写", "Sorted ustar (mtime=0) + atomic file write"),
+        zhCap: `① 识别源 ${s.kind}（${s.hasManifest ? "含 typst.toml" : "无 typst.toml 的普通目录同样是合法 Pack"}）→ ② 校验无 symlink 后按文件名字典序排列 → ③ 固定 mode 0644/0755 与 mtime=0，经临时文件原子写入 ./dist/${pName}.tar.gz。`,
+        enCap: `① Detects ${s.kind} (${s.hasManifest ? "with typst.toml" : "manifest-less directory is still a valid Pack"}) → ② Sorts files deterministically (rejecting symlinks) → ③ Packs ustar with mtime=0 and atomically writes ./dist/${pName}.tar.gz.`,
+      };
+    }
+    if (dIdx === 2) {
+      const assetName =
+        s.id === "fs-pkg" || s.id === "fs-raw" || s.id === "reg"
+          ? `${pName}.tar.gz`
+          : "pack.tar.gz";
+      return {
+        cmd: "typship copy",
+        dstArg: `https://github.com/owner/${pName}/releases/v0.1.0`,
+        stagingTitle: `releases/v0.1.0 (checking…)`,
+        finalTitle: `releases/v0.1.0`,
+        badge: "Dest::Release",
+        bridge: "upload",
+        stagingTree: [
+          { name: assetName, tag: "ustar packed", cls: "manifest" },
+          { name: "GET /releases/tags/v0.1.0", tag: "404 → create", cls: "" },
+        ],
+        finalTree: [
+          { name: `tag: v0.1.0`, tag: "GitHub Release", cls: "manifest" },
+          { name: assetName, tag: "uploaded ✓", cls: "" },
+          { name: "uploads.github.com", tag: "verified host", cls: "" },
+        ],
+        footL: "GITHUB_TOKEN / TYPSHIP_TOKEN",
+        stagingFootR: "uploading…",
+        finalFootR: `✓ ${assetName}`,
+        atomicText: window.T("404 自动创建 Release + 校验上传端点", "Auto-create Release on 404 + verified upload"),
+        zhCap: `① 识别源 ${s.kind} 与目标 GitHub Release → ② 将 Pack 确定性打包为 ${assetName} → ③ 若 v0.1.0 不存在（404）则自动创建 Release，并将归档资产上传至 uploads.github.com。`,
+        enCap: `① Detects ${s.kind} and GitHub Release target → ② Deterministically packs ${assetName} → ③ Creates release v0.1.0 on 404 and uploads the archive to uploads.github.com.`,
+      };
+    }
+    // dIdx === 3: link / fallback
+    const linkable = s.id === "fs-pkg" || s.id === "fs-raw";
+    if (linkable) {
+      return {
+        cmd: "typship link",
+        dstArg: `./vendor/${pName}`,
+        stagingTitle: `./vendor/${pName}`,
+        finalTitle: `./vendor/${pName}`,
+        badge: "Symlink (link)",
+        bridge: "symlink",
+        stagingTree: [
+          { name: "ensure_distinct(src, dst)", tag: "checking…", cls: "" },
+        ],
+        finalTree: [
+          { name: `./vendor/${pName}`, tag: "symlink ⇢", cls: "manifest" },
+          { name: `⇢ ${s.srcArg}`, tag: "live target", cls: "" },
+          { name: "Windows 无权限退化为 junction", tag: "fallback", cls: "weaker-note" },
+        ],
+        footL: "both ends linkable",
+        stagingFootR: "linking…",
+        finalFootR: "✓ symlink created",
+        atomicText: window.T("物理路径防嵌套 + 符号链接/junction", "Physical distinctness + symlink/junction"),
+        zhCap: `① 执行 typship link：源为本地目录 ${s.srcArg}，目标为目录 → ② 两端均满足可链接条件且物理路径不互为父子 → ③ 直接建立符号链接 ./vendor/${pName} ⇢ ${s.srcArg}。`,
+        enCap: `① Runs typship link: both local source ${s.srcArg} and directory destination are linkable → ② Verifies physical distinctness → ③ Creates direct symlink ./vendor/${pName} ⇢ ${s.srcArg}.`,
+      };
+    }
+    return {
+      cmd: "typship link",
+      dstArg: `./vendor/${pName}`,
+      stagingTitle: `./.vendor-${pName}-tmp/`,
+      finalTitle: `./vendor/${pName}/`,
+      badge: "Fallback Copy",
+      bridge: "fallback",
+      stagingTree: realFiles.map((f) => ({
+        name: f.name,
+        tag: "remote → copy",
+        cls: f.cls,
+      })),
+      finalTree: realFiles.map((f) => ({
+        name: f.name,
+        tag: "copied ✓",
+        cls: f.cls,
+      })),
+      footL: "remote source → copy()",
+      stagingFootR: "extracting…",
+      finalFootR: "✓ fallback copy",
+      atomicText: window.T("远端源不可软链 → 自动降级为原子 copy", "Remote source → graceful atomic copy fallback"),
+      zhCap: `① 执行 typship link：源 ${s.kind} 为远端/归档形态，无法直接建立本地目录软链 → ② 按契约自动降级为 typship copy → ③ 解包至紧邻临时目录后原子 rename 到 ./vendor/${pName}。`,
+      enCap: `① Runs typship link: source ${s.kind} is remote/archive and cannot be symlinked directly → ② Automatically falls back to typship copy → ③ Unpacks and atomically renames into ./vendor/${pName}.`,
+    };
+  }
+
+  function setStepPhase(phase, dSpec) {
+    boxSrc.classList.toggle("focus", phase === 1);
+    boxPack.classList.toggle("focus", phase === 2);
+    boxDst.classList.toggle("focus", phase >= 3);
+    boxDst.classList.toggle("staging", phase === 3);
+
+    bridge1.classList.toggle("on", phase >= 2);
+    bridge2.classList.toggle("on", phase >= 3);
+
+    if (phase < 4) {
+      boxDstTitle.textContent = dSpec.stagingTitle;
+      renderTree(treeDst, dSpec.stagingTree);
+      boxDstFootR.textContent = dSpec.stagingFootR;
+    } else {
+      boxDstTitle.textContent = dSpec.finalTitle;
+      renderTree(treeDst, dSpec.finalTree);
+      boxDstFootR.textContent = dSpec.finalFootR;
+    }
+  }
+
+  function selectPair(sIdx, dIdx, matchingPreset = -1) {
+    if (stepTimer) clearTimeout(stepTimer);
+    curSrc = sIdx;
+    curDst = dIdx;
+
+    tabs.forEach((b, i) =>
+      b.setAttribute("aria-selected", String(i === matchingPreset))
+    );
+    [...srcListEl.children].forEach((li, i) =>
+      li.classList.toggle("on", i === curSrc)
+    );
+    [...dstListEl.children].forEach((li, i) =>
+      li.classList.toggle("on", i === curDst)
+    );
+
+    const s = SOURCES[curSrc];
+    const dSpec = computeDestSpec(s, curDst);
+
+    // Update top CLI command bar
+    cmdKw.textContent = dSpec.cmd;
+    cmdSrc.textContent = s.srcArg;
+    cmdDst.textContent = dSpec.dstArg;
+    cmdTag.textContent = `${s.kind} → ${dSpec.badge}`;
+
+    pill1Sub.textContent = s.kind;
+    pill2Sub.textContent = s.mat.replace("Materialized::", "");
+    pill3Sub.textContent = dSpec.badge;
+
+    // Populate Box 1 (Source Container)
+    boxSrcTitle.textContent = s.rawTitle;
+    boxSrcBadge.textContent = `Source::${s.kind.split(" ")[0]}`;
+    renderTree(treeSrc, s.rawTree);
+    boxSrcFootL.textContent = s.rawFootL;
+    boxSrcFootR.textContent = s.rawFootR;
+
+    // Populate Box 2 (Normalized Pack)
+    boxPackTitle.textContent = `Pack · ${s.packName}`;
+    boxPackBadge.textContent = s.mat;
+    renderTree(treePack, s.packTree);
+    boxPackFootL.textContent = s.hasManifest
+      ? "typst.toml root · UTF-8 ✓"
+      : "manifest-less Pack · UTF-8 ✓";
+    boxPackFootR.textContent = "Pack Ready";
+
+    // Populate Box 3 (Destination Container)
+    boxDstBadge.textContent = dSpec.badge;
+    boxDstFootL.textContent = dSpec.footL;
+    bridge1Txt.textContent = s.mat.includes("Tarball") ? "stream" : "extract";
+    bridge2Txt.textContent = dSpec.bridge;
+
+    // Foot caption & metadata
+    capEl.textContent = window.T(dSpec.zhCap, dSpec.enCap);
+    metaManifest.textContent = s.hasManifest
+      ? window.T("含 typst.toml (自动定位包根)", "Has typst.toml (auto root)")
+      : window.T("无 typst.toml (比 Package 更弱的合法 Pack)", "No typst.toml (valid weaker Pack)");
+    metaAtomic.textContent = dSpec.atomicText;
+
+    // Step through phases: 1 (Source) -> 2 (Normalized Pack) -> 3 (Staging Dest) -> 4 (Atomic Final Dest)
+    setStepPhase(1, dSpec);
+    stepTimer = setTimeout(() => {
+      setStepPhase(2, dSpec);
+      stepTimer = setTimeout(() => {
+        setStepPhase(3, dSpec);
+        stepTimer = setTimeout(() => {
+          setStepPhase(4, dSpec);
+        }, 650);
+      }, 850);
+    }, 850);
+  }
+
+  function startAutoCycle() {
+    if (autoCycleTimer) clearInterval(autoCycleTimer);
+    autoCycleTimer = setInterval(() => {
+      if (userPinned || document.hidden) return;
+      presetIdx = (presetIdx + 1) % PRESETS.length;
+      const p = PRESETS[presetIdx];
+      selectPair(p.srcIdx, p.dstIdx, presetIdx);
+    }, 4400);
+  }
+
+  tabs.forEach((b, i) => {
+    b.addEventListener("click", () => {
+      userPinned = true;
+      presetIdx = i;
+      const p = PRESETS[i];
+      selectPair(p.srcIdx, p.dstIdx, i);
+    });
+  });
+
+  // Bilingual i18n
+  const I18N = {
+    "nav.pack": ["Pack 演示", "Pack Stage"],
+    "nav.features": ["CLI 特性", "CLI Features"],
+    "nav.install": ["安装", "Install"],
+    "nav.guide": ["指南 (Guide) →", "Guide →"],
+    "nav.get": ["安装", "Install"],
+    "hero.pill": [
+      "提出 <code>Pack</code> 概念 —— A concept weaker than a package",
+      "Introducing <code>Pack</code> — a concept weaker than a package",
+    ],
+    "hero.h1": [
+      "比 Package 更轻的 Pack，<span>在任意形态间自由拆装。</span>",
+      "Pack: weaker than a package, <span>moved across any container.</span>",
+    ],
+    "hero.lede": [
+      "正式的 Typst <b>Package</b> 要求完备的 <code>typst.toml</code> 与 <code>@ns/name:ver</code> 注册身份；而 <b>Pack</b> 是比它更弱的概念——无论是一棵尚未编写清单的本地草稿目录、GitHub 仓库里的某个模板子目录、<code>.tar.gz</code> 归档，还是 <code>@preview</code> 注册表包，都是一个 <b>Pack</b>。<b>typship</b> 按形状识别源容器与目标容器，自动剥离外壳、定位包根并原子落盘。",
+      "A formal Typst <b>Package</b> requires a complete <code>typst.toml</code> and a registered <code>@ns/name:ver</code> identity. A <b>Pack</b> is weaker: a draft directory without a manifest, a subdirectory inside a GitHub repo, a <code>.tar.gz</code> archive, or a <code>@preview</code> package is already a <b>Pack</b>. <b>typship</b> detects both ends by shape, strips outer wrappers, and places the Pack atomically.",
+    ],
+    "hero.f1": ["清单可选 · 形状直达", "Manifest optional · Shape-detected"],
+    "hero.f2": ["Source Pack 容器 → 归一化 Pack 文件树 → Dest Pack 容器", "Source Container → Normalized Pack Tree → Dest Container"],
+    "tab.0": ["1. GitHub 子目录 → 本地目录", "1. GitHub Subdir → Local Dir"],
+    "tab.1": ["2. 无清单目录 (Weaker Pack) → .tar.gz", "2. Raw Dir (No Manifest) → .tar.gz"],
+    "tab.2": ["3. @preview 包 → 本地目录", "3. @preview → Local Dir"],
+    "tab.3": ["4. 本地 Pack → GitHub Release", "4. Local Pack → GitHub Release"],
+    "tab.4": ["5. 本地目录 ⇢ 符号链接 (link)", "5. Local Dir ⇢ Symlink (link)"],
+    "col.src": ["SOURCE PACK · 源容器", "SOURCE PACK · 6 SHAPES"],
+    "col.src.sub": ["点选切换", "Click to switch"],
+    "col.dst": ["DEST PACK · 目标容器", "DEST PACK · 4 TARGETS"],
+    "col.dst.sub": ["点选切换", "Click to switch"],
+    "step.1": ["① 源容器解析", "① Source Container"],
+    "step.2": ["② 归一化为 Pack", "② Normalized Pack"],
+    "step.3": ["③ 目标容器落盘", "③ Atomic Placement"],
+    "meta.m1": ["清单约束", "Manifest"],
+    "meta.m2": ["安全校验", "Safety"],
+    "meta.m3": ["原子保障", "Atomicity"],
+    "f.eyebrow": ["核心特性 · TYPSHIP FEATURES", "TYPSHIP FEATURES"],
+    "f.h2": ["四个命令，动态演示完整的 CLI 执行过程。", "Four commands, with live dynamic CLI execution."],
+    "f.sub": [
+      "<code>typship</code> 围绕 <code>Pack</code> 抽象提供四个正交子命令：<code>init</code>、<code>copy</code>、<code>link</code> 与 <code>download</code>。下方自动轮播各特性的终端执行过程与实时文件系统变化，也可随时点选切换：",
+      "<code>typship</code> provides four orthogonal subcommands around the <code>Pack</code> abstraction: <code>init</code>, <code>copy</code>, <code>link</code>, and <code>download</code>. Watch the live CLI execution carousel below or click any tab to switch:",
+    ],
+    "fc.0.t": ["1. 初始化包骨架", "1. Init Skeleton"],
+    "fc.0.s": ["生成 typst.toml · 非空目录保护", "typst.toml · non-empty dir guard"],
+    "fc.1.t": ["2. 跨源拉取解包", "2. Unpack to Dir"],
+    "fc.1.s": ["分支试探 · 定位包根 · 原子 rename", "Ref probe · root · atomic rename"],
+    "fc.2.t": ["3. 打包与发版", "3. Pack & Ship"],
+    "fc.2.s": ["排序 ustar (mtime=0) · Release 上传", "Sorted ustar (mtime=0) · Release"],
+    "fc.3.t": ["4. 软链与缓存", "4. Link & Cache"],
+    "fc.3.s": ["本地目录 symlink · 远端降级 · 缓存", "Local symlink · fallback · cache"],
+    "fc.replay": ["↻ 重播当前", "↻ Replay"],
+    "fc.side.title": ["实时落盘状态 · File Tree", "Live State · File Tree"],
+    "ins.eyebrow": ["安装 · INSTALLATION", "INSTALLATION"],
+    "ins.h2": ["从 Git 仓库一键安装。", "Install directly from Git."],
+    "ins.cargo": ["使用 Cargo 直接安装当前主线版本：", "Install the current main branch with Cargo:"],
+    "ins.src": ["或克隆仓库本地构建与测试：", "Or clone and build from source:"],
+    "fr.eyebrow": ["延伸阅读 · FURTHER READING", "FURTHER READING"],
+    "fr.h2": ["深入了解 Pack 规范与架构指南。", "Explore the Pack Guide & Reference."],
+    "copy": ["复制", "Copy"],
+  };
+
+  function applyLang() {
+    document.documentElement.lang = window.LANG === "en" ? "en" : "zh-CN";
+    document.getElementById("lang-btn").textContent = window.LANG === "en" ? "中文" : "EN";
+    for (const [k, [zh, en]] of Object.entries(I18N)) {
+      document.querySelectorAll(`[data-i18n="${k}"]`).forEach((el) => {
+        el.innerHTML = window.LANG === "en" ? en : zh;
+      });
+    }
+    renderSelectors();
+    selectPair(curSrc, curDst, findMatchingPreset(curSrc, curDst));
+    if (typeof syncFcLang === "function") syncFcLang();
+  }
+
+  document.getElementById("lang-btn").addEventListener("click", () => {
+    window.LANG = window.LANG === "en" ? "zh" : "en";
+    try { localStorage.setItem("typship-lang", window.LANG); } catch {}
+    applyLang();
+  });
+
+  renderSelectors();
+  selectPair(0, 0, 0);
+  startAutoCycle();
+
+  // =========================================================================
+  // Section 2: Dynamic CLI Execution Carousel (4 switchable & rotating features)
+  // =========================================================================
+  const FEAT_SCENARIOS = [
+    {
+      title: "typship init · crates/typship/src/manifest.rs",
+      zhDesc: "在当前空目录生成由 toml 标准库安全序列化的 typst.toml、lib.typ 与 src/lib.typ；非空目录直接拒绝。",
+      enDesc: "Generates typst.toml (via the toml crate), lib.typ, and src/lib.typ in an empty directory; refuses non-empty directories.",
+      path: "/work/my-notes/",
+      steps: [
+        {
+          type: "cmd",
+          text: "mkdir my-notes && cd my-notes && typship init",
+          badge: ["输入命令…", "Typing…"],
+          fsStatus: "0 items (empty dir)",
+          fs: [{ name: "(empty directory)", tag: "ready", ok: false }],
+        },
+        {
+          type: "out",
+          cls: "out",
+          text: "initialized typship package `my-notes` in /work/my-notes",
+          badge: ["生成清单", "Writing manifest"],
+          fsStatus: "creating skeleton…",
+          fs: [
+            { name: "typst.toml", tag: "[package] my-notes 0.1.0", ok: true, hi: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "out",
+          text: "  typst.toml\n  lib.typ\n  src/lib.typ",
+          badge: ["骨架就绪 ✓", "Initialized ✓"],
+          fsStatus: "3 files created",
+          fs: [
+            { name: "typst.toml", tag: "entrypoints = [\"lib.typ\"]", ok: true },
+            { name: "lib.typ", tag: "#import \"src/lib.typ\"", ok: true },
+            { name: "src/lib.typ", tag: "0 bytes · module", ok: true },
+          ],
+        },
+        {
+          type: "cmd",
+          text: "typship init",
+          badge: ["再次执行…", "Re-running…"],
+          fsStatus: "3 files (non-empty)",
+          fs: [
+            { name: "typst.toml", tag: "existing", ok: true },
+            { name: "lib.typ", tag: "existing", ok: true },
+            { name: "src/lib.typ", tag: "existing", ok: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "err",
+          text: "Error: refusing to initialize: /work/my-notes is not empty",
+          badge: ["非空目录保护 ✓", "Non-empty guard ✓"],
+          fsStatus: "protected · 0 overwritten",
+          fs: [
+            { name: "ensure_empty_dir()", tag: "refused overwrite ✓", ok: true, hi: true },
+            { name: "typst.toml", tag: "untouched ✓", ok: true },
+            { name: "lib.typ & src/lib.typ", tag: "untouched ✓", ok: true },
+          ],
+        },
+      ],
+    },
+    {
+      title: "typship copy <SRC> <DIR> · crates/typship-pack/src/copy.rs",
+      zhDesc: "从 @preview、@local、GitHub 仓库或含斜杠分支子目录拉取，在同挂载点紧邻建临时目录解包并定位包根后原子 rename。",
+      enDesc: "Fetches from @preview, @local, or GitHub repo/tree (probing slash refs), extracts into an adjacent temp dir, and atomically renames.",
+      path: "/work/workspace/",
+      steps: [
+        {
+          type: "cmd",
+          text: "typship copy https://github.com/typst/templates/tree/main/charged-ieee ./ieee",
+          badge: ["识别源与目标…", "Parsing shapes…"],
+          fsStatus: "parse_source & parse_dest",
+          fs: [
+            { name: "src: Source::GithubTree", tag: "typst/templates", ok: false, hi: true },
+            { name: "dst: Dest::Dir", tag: "./ieee", ok: false },
+          ],
+        },
+        {
+          type: "out",
+          cls: "step",
+          text: [
+            "├─ 1. shallow clone → 120s 看门狗下从最长候选 ref 试探命中分支 `main`",
+            "├─ 1. shallow clone → probes longest candidate ref under 120s watchdog, hits `main`",
+          ],
+          badge: ["浅克隆试探", "Shallow clone"],
+          fsStatus: "cloning ref=main…",
+          fs: [
+            { name: "/tmp/typship-clone-*/", tag: "self-cleaning guard", ok: false, hi: true },
+            { name: "└─ charged-ieee/typst.toml", tag: "locate_subdir ✓", ok: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "step",
+          text: [
+            "├─ 2. TempDir::next_to(\"./ieee\") → 同挂载点紧邻临时目录拷贝文件树",
+            "├─ 2. TempDir::next_to(\"./ieee\") → stages Pack file tree on the same mount",
+          ],
+          badge: ["紧邻临时目录", "Adjacent staging"],
+          fsStatus: "staging on same mount",
+          fs: [
+            { name: "./.typship-copy-a8f2/", tag: "staging temp dir", ok: false, hi: true },
+            { name: "├─ typst.toml", tag: "UTF-8 · no symlink", ok: true },
+            { name: "└─ main.typ & ieee.typ", tag: "UTF-8 · no symlink", ok: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "ok",
+          text: "└─ 3. move_dir_atomic → rename(\"./.typship-copy-a8f2\", \"./ieee\") ✓",
+          badge: ["原子落盘完成 ✓", "Atomic rename ✓"],
+          fsStatus: "./ieee/ (3 files)",
+          fs: [
+            { name: "./ieee/typst.toml", tag: "atomic rename ✓", ok: true, hi: true },
+            { name: "./ieee/main.typ", tag: "placed ✓", ok: true },
+            { name: "./ieee/ieee.typ", tag: "placed ✓", ok: true },
+          ],
+        },
+      ],
+    },
+    {
+      title: "typship copy → Tarball / Release · transport.rs & github.rs",
+      zhDesc: "按文件名字典序生成确定性 ustar 归档（0644/0755, mtime=0），或自动创建 GitHub Release 并上传归档资产。",
+      enDesc: "Builds deterministic sorted ustar archives (0644/0755, mtime=0) or uploads directly to GitHub Releases (creating on 404).",
+      path: "/work/release-pipeline/",
+      steps: [
+        {
+          type: "cmd",
+          text: "typship copy ./my-pack ./dist/my-pack-0.1.0.tar.gz",
+          badge: ["确定性打包…", "Packing ustar…"],
+          fsStatus: "ensure_distinct ✓",
+          fs: [
+            { name: "./my-pack/ (source)", tag: "no symlink ✓", ok: true },
+            { name: "./dist/.my-pack.tmp", tag: "writing ustar…", ok: false, hi: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "ok",
+          text: [
+            "└─ walkdir 字典序遍历 → ustar (mode 0644, mtime/uid/gid=0) → 原子写入 ./dist/my-pack-0.1.0.tar.gz ✓",
+            "└─ walkdir sorted traversal → ustar (mode 0644, mtime/uid/gid=0) → atomically written to ./dist/my-pack-0.1.0.tar.gz ✓",
+          ],
+          badge: ["归档已生成 ✓", "Tarball written ✓"],
+          fsStatus: "byte-reproducible .tar.gz",
+          fs: [
+            { name: "./dist/my-pack-0.1.0.tar.gz", tag: "ustar · mtime=0 ✓", ok: true, hi: true },
+            { name: "├─ lib.typ", tag: "mode 0644 · uid 0", ok: true },
+            { name: "└─ typst.toml", tag: "mode 0644 · uid 0", ok: true },
+          ],
+        },
+        {
+          type: "cmd",
+          text: "GITHUB_TOKEN=ghp_… typship copy ./my-pack https://github.com/owner/my-pack/releases/v0.1.0",
+          badge: ["连接 GitHub API…", "GitHub Release API…"],
+          fsStatus: "asset: my-pack.tar.gz",
+          fs: [
+            { name: "pack_tarball(\"./my-pack\")", tag: "my-pack.tar.gz", ok: true },
+            { name: "GET /releases/tags/v0.1.0", tag: "404 → POST create", ok: false, hi: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "ok",
+          text: [
+            "└─ Release v0.1.0 就绪 → 校验主机 uploads.github.com → 上传资产 my-pack.tar.gz (201 Created) ✓",
+            "└─ Release v0.1.0 ready → verified host uploads.github.com → uploaded my-pack.tar.gz (201 Created) ✓",
+          ],
+          badge: ["Release 已发布 ✓", "Asset uploaded ✓"],
+          fsStatus: "github.com/…/releases/v0.1.0",
+          fs: [
+            { name: "Release tag: v0.1.0", tag: "published ✓", ok: true, hi: true },
+            { name: "Asset: my-pack.tar.gz", tag: "uploads.github.com ✓", ok: true },
+          ],
+        },
+      ],
+    },
+    {
+      title: "typship link & download · copy.rs & download.rs",
+      zhDesc: "link 在本地源（Fs 或 @local）到目录目标时建立 symlink，远端源自动降级为 copy；download 将包拉取到本地缓存。",
+      enDesc: "link creates symlinks for local Fs/@local sources and falls back to copy for remote sources; download populates the local cache.",
+      path: "/work/slides-project/",
+      steps: [
+        {
+          type: "cmd",
+          text: "typship link @local/shared-theme ./slides/theme",
+          badge: ["解析 @local…", "Resolving @local…"],
+          fsStatus: "latest_version_dir()",
+          fs: [
+            { name: "packages/local/shared-theme/0.2.0", tag: "max version", ok: true, hi: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "ok",
+          text: [
+            "└─ 两端皆可链接 (Registry::local → Dest::Dir) → 建立符号链接 ./slides/theme ⇢ .../shared-theme/0.2.0 ✓",
+            "└─ Both ends linkable (Registry::local → Dest::Dir) → created symlink ./slides/theme ⇢ .../shared-theme/0.2.0 ✓",
+          ],
+          badge: ["符号链接已建 ✓", "Symlink created ✓"],
+          fsStatus: "symlink active",
+          fs: [
+            { name: "./slides/theme", tag: "symlink ⇢ 0.2.0 ✓", ok: true, hi: true },
+          ],
+        },
+        {
+          type: "cmd",
+          text: "typship link @preview/cetz:0.3.2 ./slides/cetz && typship download cetz:0.3.2",
+          badge: ["降级 copy + 缓存…", "Fallback & cache…"],
+          fsStatus: "remote source → copy()",
+          fs: [
+            { name: "./slides/theme", tag: "symlink ⇢ 0.2.0 ✓", ok: true },
+            { name: "@preview/cetz:0.3.2", tag: "remote → fallback copy", ok: false, hi: true },
+          ],
+        },
+        {
+          type: "out",
+          cls: "ok",
+          text: [
+            "├─ 远端 @preview 源不满足本地软链条件 → 自动降级为 copy 原子落盘至 ./slides/cetz ✓\n└─ Downloaded cetz to ~/.local/share/typship/packages/cetz@0.3.2 ✓",
+            "├─ Remote @preview source is not local → gracefully falls back to atomic copy into ./slides/cetz ✓\n└─ Downloaded cetz to ~/.local/share/typship/packages/cetz@0.3.2 ✓",
+          ],
+          badge: ["降级与缓存完成 ✓", "Completed ✓"],
+          fsStatus: "all targets ready",
+          fs: [
+            { name: "./slides/theme", tag: "symlink ✓", ok: true },
+            { name: "./slides/cetz/", tag: "fallback copy ✓", ok: true, hi: true },
+            { name: "typship/packages/cetz@0.3.2", tag: "cached ✓", ok: true, hi: true },
+          ],
+        },
+      ],
+    },
+  ];
+
+  const fcTabs = [...document.querySelectorAll(".fc-tab")];
+  const fcBars = fcTabs.map((b) => b.querySelector(".fc-tab-progress i"));
+  const fcTermTitle = document.getElementById("fc-term-title");
+  const fcTermBody = document.getElementById("fc-term-body");
+  const fcSideBadge = document.getElementById("fc-side-badge");
+  const fcSideDesc = document.getElementById("fc-side-desc");
+  const fcFsPath = document.getElementById("fc-fs-path");
+  const fcFsStatus = document.getElementById("fc-fs-status");
+  const fcFsList = document.getElementById("fc-fs-list");
+  const fcPauseBtn = document.getElementById("fc-pause-btn");
+  const fcReplayBtn = document.getElementById("fc-replay-btn");
+
+  let fcIdx = 0;
+  let fcGen = 0;
+  let fcPaused = false;
+
+  function renderFcFs(items) {
+    fcFsList.innerHTML = items
+      .map(
+        (it) => `<li class="${it.hi ? "highlight" : ""}">
+          <span>${it.name}</span>
+          <span class="tag ${it.ok ? "ok" : ""}">${it.tag}</span>
+        </li>`
+      )
+      .join("");
+  }
+
+  function sleep(ms, myGen) {
+    return new Promise((resolve) => {
+      setTimeout(() => resolve(myGen === fcGen), ms);
+    });
+  }
+
+  async function runFeatureScenario(idx) {
+    fcGen++;
+    const myGen = fcGen;
+    fcIdx = idx;
+
+    fcTabs.forEach((b, i) => {
+      b.setAttribute("aria-selected", String(i === idx));
+      fcBars[i].style.width = "0%";
+    });
+
+    const sc = FEAT_SCENARIOS[idx];
+    fcTermTitle.textContent = sc.title;
+    fcSideDesc.textContent = window.T(sc.zhDesc, sc.enDesc);
+    fcFsPath.textContent = sc.path;
+    fcTermBody.innerHTML = "";
+
+    const totalSteps = sc.steps.length;
+
+    for (let s = 0; s < totalSteps; s++) {
+      if (myGen !== fcGen) return;
+      const st = sc.steps[s];
+      fcSideBadge.textContent = window.T(st.badge[0], st.badge[1]);
+      fcFsStatus.textContent = st.fsStatus;
+      renderFcFs(st.fs);
+
+      if (st.type === "cmd") {
+        const line = document.createElement("div");
+        line.className = "fc-line";
+        const promptSpan = document.createElement("span");
+        promptSpan.className = "p";
+        promptSpan.textContent = "$";
+        const cmdSpan = document.createElement("span");
+        cmdSpan.className = "cmd";
+        const cursor = document.createElement("span");
+        cursor.className = "fc-cursor";
+        line.append(promptSpan, cmdSpan, cursor);
+        fcTermBody.appendChild(line);
+
+        // Typewriter effect
+        const chars = st.text;
+        const stepSize = Math.max(2, Math.ceil(chars.length / 22));
+        for (let c = stepSize; c <= chars.length; c += stepSize) {
+          if (myGen !== fcGen) return;
+          cmdSpan.textContent = chars.slice(0, c);
+          fcBars[idx].style.width = `${Math.round(((s + (c / chars.length) * 0.6) / totalSteps) * 100)}%`;
+          await sleep(28, myGen);
+        }
+        cmdSpan.textContent = chars;
+        await sleep(260, myGen);
+        if (myGen !== fcGen) return;
+        cursor.remove();
+      } else {
+        const line = document.createElement("div");
+        line.className = "fc-line";
+        const content = document.createElement("span");
+        content.className = st.cls || "out";
+        content.textContent = Array.isArray(st.text)
+          ? window.T(st.text[0], st.text[1])
+          : st.text;
+        line.appendChild(content);
+        fcTermBody.appendChild(line);
+        fcBars[idx].style.width = `${Math.round(((s + 1) / totalSteps) * 100)}%`;
+        await sleep(820, myGen);
+      }
+    }
+
+    if (myGen !== fcGen) return;
+    fcBars[idx].style.width = "100%";
+    await sleep(1900, myGen);
+    if (myGen === fcGen && !fcPaused) {
+      runFeatureScenario((idx + 1) % FEAT_SCENARIOS.length);
+    }
+  }
+
+  function syncFcLang() {
+    fcPauseBtn.textContent = fcPaused
+      ? window.T("▶ 继续轮播", "▶ Resume")
+      : window.T("暂停轮播", "Pause");
+    runFeatureScenario(fcIdx);
+  }
+
+  fcTabs.forEach((btn, i) => {
+    btn.addEventListener("click", () => {
+      runFeatureScenario(i);
+    });
+  });
+
+  fcPauseBtn.addEventListener("click", () => {
+    fcPaused = !fcPaused;
+    fcPauseBtn.textContent = fcPaused
+      ? window.T("▶ 继续轮播", "▶ Resume")
+      : window.T("暂停轮播", "Pause");
+    if (!fcPaused) {
+      runFeatureScenario((fcIdx + 1) % FEAT_SCENARIOS.length);
+    }
+  });
+
+  fcReplayBtn.addEventListener("click", () => {
+    runFeatureScenario(fcIdx);
+  });
+
+  runFeatureScenario(0);
+})();
+</script>
+</body>
+</html>
