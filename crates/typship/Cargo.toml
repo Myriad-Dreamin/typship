@@ -1,6 +1,6 @@
 [package]
 name = "typship"
-description = "The description."
+description.workspace = true
 categories = ["compilers"]
 keywords = ["language", "compiler"]
 authors.workspace = true
