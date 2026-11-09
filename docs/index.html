@@ -585,18 +585,7 @@ footer a:hover { color: var(--ink); }
   <div class="first-screen" id="pack-stage">
     <div class="hero-top">
       <div class="hero-title-group">
-        <div class="concept-pill">
-          <span class="tag-dot"></span>
-          <span data-i18n="hero.pill">提出 <code>Pack</code> 概念 —— A concept weaker than a package</span>
-        </div>
-        <h1 data-i18n="hero.h1">比 Package 更轻的 Pack，<span>在任意形态间自由拆装。</span></h1>
-        <p class="lede" data-i18n="hero.lede">
-          正式的 Typst <b>Package</b> 要求完备的 <code>typst.toml</code> 与 <code>@ns/name:ver</code> 注册身份；而 <b>Pack</b> 是比它更弱的概念——无论是一棵尚未编写清单的本地草稿目录、GitHub 仓库里的某个模板子目录、<code>.tar.gz</code> 归档，还是 <code>@preview</code> 注册表包，都是一个 <b>Pack</b>。<b>typship</b> 按形状识别源容器与目标容器，自动剥离外壳、定位包根并原子落盘。
-        </p>
-      </div>
-      <div class="hero-badges">
-        <div class="formula"><b>Pack</b> ⊃ <b>Package</b> · <span data-i18n="hero.f1">清单可选 · 形状直达</span></div>
-        <div class="formula"><span data-i18n="hero.f2">Source Pack 容器 → 归一化 Pack 文件树 → Dest Pack 容器</span></div>
+        <h1 data-i18n="hero.h1">From any Source, to any Destination.</h1>
       </div>
     </div>
 
@@ -604,11 +593,11 @@ footer a:hover { color: var(--ink); }
     <div class="pk" id="pk">
       <div class="pk-top">
         <div class="pk-tabs" role="tablist" aria-label="Pack Scenarios">
-          <button role="tab" data-preset="0" aria-selected="true" data-i18n="tab.0">1. GitHub 子目录 → 本地目录</button>
-          <button role="tab" data-preset="1" aria-selected="false" data-i18n="tab.1">2. 无清单目录 (Weaker Pack) → .tar.gz</button>
-          <button role="tab" data-preset="2" aria-selected="false" data-i18n="tab.2">3. @preview 包 → 本地目录</button>
-          <button role="tab" data-preset="3" aria-selected="false" data-i18n="tab.3">4. 本地 Pack → GitHub Release</button>
-          <button role="tab" data-preset="4" aria-selected="false" data-i18n="tab.4">5. 本地目录 ⇢ 符号链接 (link)</button>
+          <button role="tab" data-preset="0" aria-selected="true" data-i18n="tab.0">1. GitHub → Fs</button>
+          <button role="tab" data-preset="1" aria-selected="false" data-i18n="tab.1">2. Fs → package.tar.gz</button>
+          <button role="tab" data-preset="2" aria-selected="false" data-i18n="tab.2">3. Typst University → Fs</button>
+          <button role="tab" data-preset="3" aria-selected="false" data-i18n="tab.3">4. Fs → GitHub Release</button>
+          <button role="tab" data-preset="4" aria-selected="false" data-i18n="tab.4">5. 符号链接 (link)</button>
         </div>
       </div>
 
@@ -699,24 +688,12 @@ footer a:hover { color: var(--ink); }
           </div>
         </div>
       </div>
-
-      <div class="pk-foot">
-        <p class="pk-cap" id="pk-cap">
-          ① 浅克隆仓库并剥离 .git 与外层目录 → ② 提取子目录 charged-ieee 形成干净的 Pack 文件树 → ③ 在 ./ieee 旁建临时目录解包并一次 rename 原子到位。
-        </p>
-        <div class="pk-meta-pills">
-          <span><span data-i18n="meta.m1">清单约束</span> <b id="meta-manifest">含 typst.toml (自动定位包根)</b></span>
-          <span><span data-i18n="meta.m2">安全校验</span> <b>UTF-8 · 严拒 .. 与 symlink</b></span>
-          <span><span data-i18n="meta.m3">原子保障</span> <b id="meta-atomic">同挂载点临时目录 + rename</b></span>
-        </div>
-      </div>
     </div>
   </div>
 
   <!-- 2. SECOND SCREEN: Typship Features (Dynamic CLI Execution Carousel) -->
   <section id="features">
-    <p class="eyebrow" data-i18n="f.eyebrow">核心特性 · TYPSHIP FEATURES</p>
-    <h2 data-i18n="f.h2">四个命令，动态演示完整的 CLI 执行过程。</h2>
+    <h2 data-i18n="f.h2">CLI示例</h2>
     <p class="sub" data-i18n="f.sub">
       <code>typship</code> 围绕 <code>Pack</code> 抽象提供四个正交子命令：<code>init</code>、<code>copy</code>、<code>link</code> 与 <code>download</code>。下方自动轮播各特性的终端执行过程与实时文件系统变化，也可随时点选切换：
     </p>
@@ -797,8 +774,7 @@ footer a:hover { color: var(--ink); }
 
   <!-- 3. THIRD SCREEN: Installation -->
   <section id="install">
-    <p class="eyebrow" data-i18n="ins.eyebrow">安装 · INSTALLATION</p>
-    <h2 data-i18n="ins.h2">从 Git 仓库一键安装。</h2>
+    <h2 data-i18n="ins.h2">安装方法</h2>
     <div class="install-card">
       <div>
         <div style="font-size:15px; font-weight:620; color:var(--ink);" data-i18n="ins.cargo">使用 Cargo 直接安装当前主线版本：</div>
@@ -822,7 +798,6 @@ cargo test --workspace</pre>
 
   <!-- 4. FOURTH SCREEN: Further Reading (Navigate to Guide) -->
   <section id="further-reading">
-    <p class="eyebrow" data-i18n="fr.eyebrow">延伸阅读 · FURTHER READING</p>
     <h2 data-i18n="fr.h2">深入了解 Pack 规范与架构指南。</h2>
     <p class="sub" data-i18n="fr.sub">
       前往完整指南页面，查阅所有源/目标形状匹配优先级、安全解包白名单与双 Crate 模块设计。
@@ -1128,10 +1103,6 @@ cargo test --workspace</pre>
   const boxDstFootL = document.getElementById("box-dst-foot-l");
   const boxDstFootR = document.getElementById("box-dst-foot-r");
 
-  const capEl = document.getElementById("pk-cap");
-  const metaManifest = document.getElementById("meta-manifest");
-  const metaAtomic = document.getElementById("meta-atomic");
-
   let curSrc = 0;
   let curDst = 0;
   let stepTimer = null;
@@ -1402,13 +1373,6 @@ cargo test --workspace</pre>
     bridge1Txt.textContent = s.mat.includes("Tarball") ? "stream" : "extract";
     bridge2Txt.textContent = dSpec.bridge;
 
-    // Foot caption & metadata
-    capEl.textContent = window.T(dSpec.zhCap, dSpec.enCap);
-    metaManifest.textContent = s.hasManifest
-      ? window.T("含 typst.toml (自动定位包根)", "Has typst.toml (auto root)")
-      : window.T("无 typst.toml (比 Package 更弱的合法 Pack)", "No typst.toml (valid weaker Pack)");
-    metaAtomic.textContent = dSpec.atomicText;
-
     // Step through phases: 1 (Source) -> 2 (Normalized Pack) -> 3 (Staging Dest) -> 4 (Atomic Final Dest)
     setStepPhase(1, dSpec);
     stepTimer = setTimeout(() => {
@@ -1448,37 +1412,19 @@ cargo test --workspace</pre>
     "nav.install": ["安装", "Install"],
     "nav.guide": ["指南 (Guide) →", "Guide →"],
     "nav.get": ["安装", "Install"],
-    "hero.pill": [
-      "提出 <code>Pack</code> 概念 —— A concept weaker than a package",
-      "Introducing <code>Pack</code> — a concept weaker than a package",
-    ],
     "hero.h1": [
-      "比 Package 更轻的 Pack，<span>在任意形态间自由拆装。</span>",
-      "Pack: weaker than a package, <span>moved across any container.</span>",
+      "From any Source, to any Destination.",
+      "From any Source, to any Destination.",
     ],
-    "hero.lede": [
-      "正式的 Typst <b>Package</b> 要求完备的 <code>typst.toml</code> 与 <code>@ns/name:ver</code> 注册身份；而 <b>Pack</b> 是比它更弱的概念——无论是一棵尚未编写清单的本地草稿目录、GitHub 仓库里的某个模板子目录、<code>.tar.gz</code> 归档，还是 <code>@preview</code> 注册表包，都是一个 <b>Pack</b>。<b>typship</b> 按形状识别源容器与目标容器，自动剥离外壳、定位包根并原子落盘。",
-      "A formal Typst <b>Package</b> requires a complete <code>typst.toml</code> and a registered <code>@ns/name:ver</code> identity. A <b>Pack</b> is weaker: a draft directory without a manifest, a subdirectory inside a GitHub repo, a <code>.tar.gz</code> archive, or a <code>@preview</code> package is already a <b>Pack</b>. <b>typship</b> detects both ends by shape, strips outer wrappers, and places the Pack atomically.",
-    ],
-    "hero.f1": ["清单可选 · 形状直达", "Manifest optional · Shape-detected"],
-    "hero.f2": ["Source Pack 容器 → 归一化 Pack 文件树 → Dest Pack 容器", "Source Container → Normalized Pack Tree → Dest Container"],
-    "tab.0": ["1. GitHub 子目录 → 本地目录", "1. GitHub Subdir → Local Dir"],
-    "tab.1": ["2. 无清单目录 (Weaker Pack) → .tar.gz", "2. Raw Dir (No Manifest) → .tar.gz"],
-    "tab.2": ["3. @preview 包 → 本地目录", "3. @preview → Local Dir"],
-    "tab.3": ["4. 本地 Pack → GitHub Release", "4. Local Pack → GitHub Release"],
-    "tab.4": ["5. 本地目录 ⇢ 符号链接 (link)", "5. Local Dir ⇢ Symlink (link)"],
-    "col.src": ["SOURCE PACK · 源容器", "SOURCE PACK · 6 SHAPES"],
-    "col.src.sub": ["点选切换", "Click to switch"],
-    "col.dst": ["DEST PACK · 目标容器", "DEST PACK · 4 TARGETS"],
-    "col.dst.sub": ["点选切换", "Click to switch"],
-    "step.1": ["① 源容器解析", "① Source Container"],
-    "step.2": ["② 归一化为 Pack", "② Normalized Pack"],
-    "step.3": ["③ 目标容器落盘", "③ Atomic Placement"],
-    "meta.m1": ["清单约束", "Manifest"],
-    "meta.m2": ["安全校验", "Safety"],
-    "meta.m3": ["原子保障", "Atomicity"],
-    "f.eyebrow": ["核心特性 · TYPSHIP FEATURES", "TYPSHIP FEATURES"],
-    "f.h2": ["四个命令，动态演示完整的 CLI 执行过程。", "Four commands, with live dynamic CLI execution."],
+    "tab.0": ["1. GitHub → Fs", "1. GitHub → Fs"],
+    "tab.1": ["2. Fs → package.tar.gz", "2. Fs → package.tar.gz"],
+    "tab.2": ["3. Typst University → Fs", "3. Typst University → Fs"],
+    "tab.3": ["4. Fs → GitHub Release", "4. Fs → GitHub Release"],
+    "tab.4": ["5. 符号链接 (link)", "5. Symlink (link)"],
+    "step.1": ["① SOURCE PACK · 源容器", "① SOURCE PACK"],
+    "step.2": ["② NORMALIZED PACK · 归一化", "② NORMALIZED PACK"],
+    "step.3": ["③ DEST PACK · 目标容器", "③ DEST PACK"],
+    "f.h2": ["CLI示例", "CLI Examples"],
     "f.sub": [
       "<code>typship</code> 围绕 <code>Pack</code> 抽象提供四个正交子命令：<code>init</code>、<code>copy</code>、<code>link</code> 与 <code>download</code>。下方自动轮播各特性的终端执行过程与实时文件系统变化，也可随时点选切换：",
       "<code>typship</code> provides four orthogonal subcommands around the <code>Pack</code> abstraction: <code>init</code>, <code>copy</code>, <code>link</code>, and <code>download</code>. Watch the live CLI execution carousel below or click any tab to switch:",
@@ -1493,11 +1439,9 @@ cargo test --workspace</pre>
     "fc.3.s": ["本地目录 symlink · 远端降级 · 缓存", "Local symlink · fallback · cache"],
     "fc.replay": ["↻ 重播当前", "↻ Replay"],
     "fc.side.title": ["实时落盘状态 · File Tree", "Live State · File Tree"],
-    "ins.eyebrow": ["安装 · INSTALLATION", "INSTALLATION"],
-    "ins.h2": ["从 Git 仓库一键安装。", "Install directly from Git."],
+    "ins.h2": ["安装方法", "Installation"],
     "ins.cargo": ["使用 Cargo 直接安装当前主线版本：", "Install the current main branch with Cargo:"],
     "ins.src": ["或克隆仓库本地构建与测试：", "Or clone and build from source:"],
-    "fr.eyebrow": ["延伸阅读 · FURTHER READING", "FURTHER READING"],
     "fr.h2": ["深入了解 Pack 规范与架构指南。", "Explore the Pack Guide & Reference."],
     "copy": ["复制", "Copy"],
   };
